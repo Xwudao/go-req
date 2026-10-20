@@ -662,6 +662,31 @@ client = configured
 - 不自动重试、不缓存响应、不自动读取成功响应 Body。
 - 需要复杂网络配置时，直接使用 `http.Client` / `http.Transport` 或自定义 `http.RoundTripper`。
 
+## 浏览器指纹扩展
+
+浏览器 TLS/HTTP2 指纹模拟由独立模块 [`go-req-impersonate`](https://github.com/Xwudao/go-req-impersonate) 提供。核心库不依赖 uTLS、tls-client 或 fhttp，也不需要为此修改 `net/http` 兼容层。
+
+```go
+transport, err := impersonate.New(
+    impersonate.Chrome(),
+    impersonate.WithProxy("http://127.0.0.1:7890"),
+)
+if err != nil {
+    return err
+}
+
+client := req.New(req.WithTransport(transport))
+```
+
+该模块返回标准 `http.RoundTripper`，因此仍然适用：
+
+- `go-req` 的 Debug 可以正常包装该 Transport。
+- `WithTransport` 不能与核心 `WithProxy` 或 `WithDialContext` 组合；冲突会返回 `ErrConfiguration`，不会静默忽略。
+- 插件自身通过 `impersonate.WithProxy` 管理代理。
+- 需要关闭空闲连接时调用 `transport.CloseIdleConnections()`。
+
+指纹模拟不等于完整浏览器环境，也不保证绕过任何网站的检测。具体 Profile 版本、代理边界和限制请阅读该模块 README。
+
 ## 第一版暂不包含
 
 自动重试、HTTP 缓存、WebSocket、SSE 专用抽象、Cookie 持久化封装、自动限流、熔断器、复杂 Middleware、服务发现、泛型 DSL、内置日志框架。
