@@ -2,7 +2,7 @@
 
 `go-req`（package `req`）是一个轻量级、标准库优先的 HTTP Client 请求库。
 
-它不是对 `net/http` 的重新实现，而是在标准库之上提供更短的请求构建路径。原生 `http.Client`、`http.Transport`、`http.RoundTripper`、`DialContext`、`TLSClientConfig`、`CookieJar`、`CheckRedirect` 等能力全部保留。
+它不是对 `net/http` 的重新实现，而是在标准库之上提供更短的请求构建路径。原生 `http.Client`、`http.Transport`、`http.RoundTripper`、`DialContext`、`Proxy`、`TLSClientConfig`、`CookieJar`、`CheckRedirect` 等能力全部保留。
 
 设计原则：
 
@@ -197,7 +197,7 @@ client := req.New(req.WithHTTPClient(custom))
 
 自定义 Client 的 Transport、Jar、CheckRedirect、Timeout 行为全部保留。`client.HTTPClient()` 会返回同一个指针。
 
-由于 `req` 不会修改外部 Client，`WithHTTPClient` 不能与 `WithTimeout`、`WithTransport`、`WithDialContext` 组合。需要这些配置时，直接设置 `http.Client` 或 `http.Transport` 的对应字段。
+由于 `req` 不会修改外部 Client，`WithHTTPClient` 不能与 `WithTimeout`、`WithTransport`、`WithDialContext` 或任何代理 Option 组合。需要这些配置时，直接设置 `http.Client` 或 `http.Transport` 的对应字段。
 
 ## 自定义 Transport
 
@@ -213,6 +213,8 @@ client := req.New(req.WithTransport(transport))
 ```
 
 `req` 会创建自己的 `http.Client` 并引用该 Transport，但不会修改 Transport 的字段。Transport 的所有权和生命周期仍归调用方。
+
+与代理 Option 组合时，传入的 Transport 必须是 `*http.Transport`。`req` 会先 `Clone()` 它，再在克隆实例上设置 `Proxy`；原 Transport 的 `TLSClientConfig`、`DialContext`、连接池等配置全部保留，调用方的 Transport 不会被修改。
 
 `WithTransport` 可以与 `WithTimeout` 组合，超时设置在 `req` 创建的 `http.Client` 上：
 
@@ -241,8 +243,58 @@ client := req.New(
 边界说明：
 
 - `WithDialContext` 不能与 `WithTransport` 或 `WithHTTPClient` 组合。`req` 不会对未知 Transport 做类型断言或隐式覆盖；需要组合时请直接配置 `http.Transport.DialContext`。
-- `DialContext` 控制的是网络拨号，不是请求的最终目标。例如环境变量配置了 HTTP 代理时，这里拨号的是代理地址。
+- `DialContext` 控制的是网络拨号，不是请求的最终目标。使用代理时，这里拨号的是代理地址。
 - 已有的空闲连接不会重新拨号。
+- `WithDialContext` 可以与代理 Option 组合，两者都应用到 `req` 克隆出的独立 `*http.Transport`。
+
+## 代理配置
+
+默认行为与标准库一致：使用 `http.ProxyFromEnvironment`，读取 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`（及对应小写形式）等环境变量。代理能力完全由 `http.Transport.Proxy` 提供，`req` 不实现 HTTP、HTTPS CONNECT 或 SOCKS5 协议本身。
+
+固定代理：
+
+```go
+client := req.New(
+    req.WithProxy("http://user:password@127.0.0.1:8080"),
+)
+```
+
+支持 `http://`、`https://`、`socks5://`、`socks5h://`，以及 URL 中的用户名密码。HTTP/HTTPS 代理省略端口时使用标准库默认端口；SOCKS5 代理必须显式指定端口。
+
+完全禁用代理，包括忽略所有代理环境变量：
+
+```go
+client := req.New(req.WithoutProxy())
+```
+
+显式恢复环境变量代理：
+
+```go
+client := req.New(req.WithProxyFromEnvironment())
+```
+
+按请求选择代理：
+
+```go
+client := req.New(req.WithProxyFunc(func(r *http.Request) (*url.URL, error) {
+    if strings.HasPrefix(r.URL.Host, "internal.") {
+        return nil, nil // 直连
+    }
+    return url.Parse("socks5h://127.0.0.1:1080")
+}))
+```
+
+`WithProxyFunc` 直接使用标准库签名。函数由 `http.Transport` 在每次连接尝试时调用，可以返回 `nil` 表示直连。需要为不同请求使用完全独立的代理配置时，也可以创建多个 `Client`。
+
+规则与边界：
+
+- `WithProxy` 会校验 Scheme、Host 和端口：拒绝相对地址、不支持的 Scheme、空主机、无效或越界端口、SOCKS5 缺少端口，以及带 path/query/fragment 的代理 URL。
+- 所有代理 Option 只在 `New` / `NewWithOptions` 初始化阶段应用。Request Builder 不会动态修改 Transport。
+- 默认 Transport 是 `http.DefaultTransport` 的独立 Clone。`WithTransport` 与代理 Option 组合时会 Clone 调用方的 `*http.Transport`，不会修改原对象。
+- `WithHTTPClient` 无法安全设置代理，不能与任何代理 Option 组合。`WithTransport` 使用自定义 `RoundTripper` 时也无法安全设置 `Proxy`，会返回明确的配置冲突错误；只有 `*http.Transport` 可以被 Clone 后设置代理。
+- 冲突检测与 Option 顺序无关。`WithProxy`、`WithoutProxy`、`WithProxyFromEnvironment`、`WithProxyFunc` 对同一 Client 重复设置时最后一个生效。
+- `WithDialContext` 可以与代理 Option 组合；`WithTransport` 与 `WithDialContext` 仍然互斥。
+- Debug 不会输出代理用户名、密码或 `Proxy-Authorization` 的值；请求 URL 中的 userinfo 也会被脱敏。
 
 ## 原生 Request / Response
 
@@ -531,9 +583,13 @@ type Option func(*Client) error
 | `WithBaseURL` | 设置 BaseURL；重复设置时最后一个生效；必须是不含 query/fragment 的绝对 URL |
 | `WithTimeout` | 设置 `req` 创建的 `http.Client.Timeout` |
 | `WithHeader` | 累积默认 Header；同名 Header 最后一次生效 |
-| `WithHTTPClient` | 直接使用外部 Client；不可与 Timeout/Transport/DialContext 组合 |
-| `WithTransport` | 使用外部 RoundTripper；不修改它；不可与 HTTPClient/DialContext 组合 |
-| `WithDialContext` | 克隆默认 Transport 并设置 DialContext；不可与 HTTPClient/Transport 组合 |
+| `WithHTTPClient` | 直接使用外部 Client；不可与 Timeout/Transport/DialContext/代理 Option 组合 |
+| `WithTransport` | 使用外部 RoundTripper；不修改它；不可与 HTTPClient/DialContext 组合；与代理组合时必须为 `*http.Transport` 并会被 Clone |
+| `WithDialContext` | 克隆默认 Transport 并设置 DialContext；不可与 HTTPClient/Transport 组合；可与代理组合 |
+| `WithProxy` | 设置固定代理 URL；校验 Scheme/Host/端口；不可与 HTTPClient 或自定义 RoundTripper 组合 |
+| `WithoutProxy` | 设置 `Transport.Proxy = nil`，完全禁用环境变量代理 |
+| `WithProxyFromEnvironment` | 恢复 `http.ProxyFromEnvironment`；这是默认行为 |
+| `WithProxyFunc` | 使用标准库 Proxy 函数；由 Transport 按连接尝试调用 |
 | `WithMaxResponseBytes` | 设置 ToJSON/ToBytes/ToString 的读取上限 |
 | `WithDebug` | 开启或关闭 Debug；默认关闭 |
 | `WithDebugWriter` | 设置 Debug 输出目标；默认 `os.Stdout` |
@@ -570,6 +626,8 @@ client = configured
 - 外部 `http.Client` 和 `http.RoundTripper` 归调用方所有，`req` 不修改它们。
 - `HTTPClient()` 返回底层指针；调用方不得在并发使用期间修改。
 - `WithDialContext` 只修改自己克隆出来的 Transport。
+- 代理 Option 只修改 `req` 自己克隆出来的 Transport；与 `WithTransport` 组合时不会修改调用方的 Transport。
+- 代理凭据只用于 `http.Transport` 内部认证，不会写入 Debug 输出。
 
 ## URL 解析规则
 
@@ -600,6 +658,7 @@ client = configured
 - 请求最终是标准库 `*http.Request`，可以通过 `Build()` 获取。
 - 原生 `Client.Do` 路径完全不应用 BaseURL、默认 Header 等 Builder 特性。
 - 不使用隐藏的全局状态，不修改 `http.DefaultClient` / `http.DefaultTransport`。
+- 代理只是 `http.Transport.Proxy` 的一项配置，不是独立的网络实现层；不引入 ProxyManager、ProxyClient 等抽象。
 - 不自动重试、不缓存响应、不自动读取成功响应 Body。
 - 需要复杂网络配置时，直接使用 `http.Client` / `http.Transport` 或自定义 `http.RoundTripper`。
 

@@ -57,6 +57,9 @@ type Client struct {
 	hasTransport   bool
 	dialContext    func(ctx context.Context, network, address string) (net.Conn, error)
 	hasDialContext bool
+	proxyFunc      func(*http.Request) (*url.URL, error)
+	proxyOption    string
+	hasProxyConfig bool
 }
 
 func newClient() *Client {
@@ -136,6 +139,20 @@ func (c *Client) finalize() error {
 			"WithDialContext cannot be combined with WithTransport; configure http.Transport.DialContext directly",
 		))
 	}
+	if c.hasHTTPClient && c.hasProxyConfig {
+		conflicts = append(conflicts, configError(
+			"%s cannot be combined with WithHTTPClient; set http.Client.Transport.Proxy instead",
+			c.proxyOption,
+		))
+	}
+	if c.hasTransport && c.hasProxyConfig {
+		if _, ok := c.transport.(*http.Transport); !ok {
+			conflicts = append(conflicts, configError(
+				"%s cannot be combined with WithTransport using custom RoundTripper %T; only *http.Transport can be cloned to set Proxy",
+				c.proxyOption, c.transport,
+			))
+		}
+	}
 	if len(conflicts) > 0 {
 		return errors.Join(conflicts...)
 	}
@@ -158,7 +175,22 @@ func (c *Client) finalize() error {
 
 func (c *Client) newTransport() (http.RoundTripper, error) {
 	if c.hasTransport {
-		return c.transport, nil
+		if !c.hasProxyConfig {
+			return c.transport, nil
+		}
+		// A caller-supplied *http.Transport is cloned so setting Proxy never
+		// mutates the caller's transport. Clone preserves TLS, DialContext,
+		// connection pool, and all other settings.
+		transport, ok := c.transport.(*http.Transport)
+		if !ok {
+			return nil, configError(
+				"%s cannot be applied to custom RoundTripper %T; only *http.Transport can be cloned to set Proxy",
+				c.proxyOption, c.transport,
+			)
+		}
+		clone := transport.Clone()
+		clone.Proxy = c.proxyFunc
+		return clone, nil
 	}
 
 	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
@@ -172,6 +204,9 @@ func (c *Client) newTransport() (http.RoundTripper, error) {
 	transport := defaultTransport.Clone()
 	if c.hasDialContext {
 		transport.DialContext = c.dialContext
+	}
+	if c.hasProxyConfig {
+		transport.Proxy = c.proxyFunc
 	}
 	return transport, nil
 }

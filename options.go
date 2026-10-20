@@ -12,13 +12,15 @@ import (
 // Option configures a Client.
 //
 // Options are applied in argument order. Options that set a single value
-// (BaseURL, timeout, HTTP client, transport, dial function, and response size
-// limit) are last-one-wins. WithHeader accumulates headers.
+// (BaseURL, timeout, HTTP client, transport, dial function, proxy selection, and
+// response size limit) are last-one-wins. WithHeader accumulates headers.
 //
 // Incompatible combinations are detected after every option has been applied,
 // so the result does not depend on option order. In particular, WithHTTPClient
-// cannot be combined with WithTimeout, WithTransport, or WithDialContext, and
-// WithTransport cannot be combined with WithDialContext. Use NewWithOptions to
+// cannot be combined with WithTimeout, WithTransport, WithDialContext, or any
+// proxy option, and WithTransport cannot be combined with WithDialContext.
+// Proxy options combined with WithTransport require the supplied RoundTripper
+// to be an *http.Transport so it can be cloned safely. Use NewWithOptions to
 // handle these errors explicitly.
 type Option func(*Client) error
 
@@ -84,8 +86,8 @@ func WithHeader(key, value string) Option {
 // and Timeout behavior are all preserved. The caller retains ownership and must
 // not mutate the client while it is in use.
 //
-// WithHTTPClient cannot be combined with WithTimeout, WithTransport, or
-// WithDialContext.
+// WithHTTPClient cannot be combined with WithTimeout, WithTransport,
+// WithDialContext, or any proxy option.
 func WithHTTPClient(client *http.Client) Option {
 	return func(c *Client) error {
 		if client == nil {
@@ -102,6 +104,10 @@ func WithHTTPClient(client *http.Client) Option {
 // req wraps the transport in its own http.Client but never changes the
 // transport's configuration. The caller retains ownership of the transport.
 // WithTransport cannot be combined with WithHTTPClient or WithDialContext.
+//
+// When combined with a proxy option, transport must be an *http.Transport. req
+// clones it, sets Proxy on the clone, and leaves the caller's transport
+// untouched.
 func WithTransport(transport http.RoundTripper) Option {
 	return func(c *Client) error {
 		if transport == nil {
@@ -123,6 +129,9 @@ func WithTransport(transport http.RoundTripper) Option {
 // this function, not the proxy's final destination. Custom transports and
 // custom http.Clients are not introspected, which is why WithDialContext cannot
 // be combined with WithTransport or WithHTTPClient.
+//
+// WithDialContext can be combined with proxy options; both are applied to req's
+// cloned *http.Transport.
 func WithDialContext(dial func(ctx context.Context, network, address string) (net.Conn, error)) Option {
 	return func(c *Client) error {
 		if dial == nil {
