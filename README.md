@@ -181,6 +181,30 @@ err := client.Post(ctx, "/login").
 
 Form 使用 `url.Values.Encode()`，Content-Type 默认为 `application/x-www-form-urlencoded`。
 
+## Multipart 文件上传
+
+```go
+file, err := os.Open("report.pdf")
+if err != nil {
+    return err
+}
+defer file.Close() // Reader 始终归调用方所有
+
+err = client.Post(ctx, "/upload").Multipart(
+    url.Values{"description": {"月报"}},
+    req.MultipartFile{
+        FieldName:   "files",
+        FileName:    "report.pdf",
+        ContentType: "application/pdf", // 可省略，默认 application/octet-stream
+        Reader:      file,
+    },
+).ToJSON(&result)
+```
+
+可传多个 `MultipartFile`，允许相同 FieldName。字段和文件元数据在调用时复制；文件不缓冲到内存，Build 不读取文件，也不启动后台 goroutine。文件 Reader 只消费一次，不支持自动重放或重定向重发；重复 Build 不会倒回。调用方负责关闭文件，包括请求失败或取消时。Context 在每次读取前检查；阻塞中的自定义 Reader 需要调用方负责解除阻塞。
+
+Multipart 自动生成带 boundary 的 Content-Type。显式 Header 会覆盖它，通常不应手动设置。无论使用 Body、JSON、Form 还是 Multipart，切换 Body 类型时都应确保 Content-Type 与实际内容匹配。
+
 ## 原生 http.Client
 
 `WithHTTPClient` 直接使用调用方提供的指针，不复制、不修改：
@@ -384,9 +408,41 @@ if errors.Is(err, req.ErrResponseTooLarge) {
 }
 ```
 
-`Do` 不受该限制，也不会提前读取或关闭 Body。下载大文件应使用 `Do` + `io.Copy`。
+单次请求可以覆盖读取上限，不影响同一个 Client 的其他请求：
+
+```go
+data, err := client.Get(ctx, "/raw").MaxResponseBytes(1 << 20).ToBytes()
+```
+
+上限必须大于零且小于 `math.MaxInt64`，仅影响 ToJSON/ToBytes/ToString，不影响 Do/ToWriter。
+
+`Do` 不受该限制，也不会提前读取或关闭 Body。下载大文件可使用 `Do` + `io.Copy`，或使用 `ToWriter`：
+
+```go
+file, err := os.Create("report.zip")
+if err != nil {
+    return err
+}
+defer file.Close()
+n, err := client.Get(ctx, "/report.zip").ToWriter(file)
+```
+
+`ToWriter` 检查 2xx 状态、流式写入、自动关闭响应 Body，但不关闭 Writer；失败时返回已写入的字节数。非 2xx 不写入 Writer，返回 StatusError。它没有隐式大小上限，处理不可信下载时请配置 Context deadline 或限量 Writer。发生错误时 Writer 可能已有部分数据；文件创建、覆盖、清理由调用方负责。
 
 空 Body（包括 `204 No Content`）传给 `ToJSON` 时返回 `nil`，不会修改目标值。JSON `null` 按 `encoding/json` 的标准语义处理。
+
+JSON 解码可按请求启用选项，默认行为不变：
+
+```go
+var data map[string]any
+err := client.Get(ctx, "/numbers").UseNumber(true).ToJSON(&data)
+// data 中的数字使用 json.Number，避免 float64 精度损失。
+
+err = client.Get(ctx, "/user").DisallowUnknownFields(true).ToJSON(&user)
+// 返回结构体未定义的字段时解码失败；错误可能发生在部分字段已写入之后。
+```
+
+两项可组合，仍只接受单个完整 JSON 文档，不接受尾随内容。
 
 ## Debug
 
@@ -430,6 +486,21 @@ err = client.Get(ctx, "/health").
 Builder 的 Debug 覆盖会随 `Build()` 生成的请求一起保留，因此
 `client.Do(builtRequest)` 也会遵守该设置。原生 `Client.Do` 在未携带 Builder
 覆盖时使用 Client 级别的 Debug 配置。
+
+并发请求的 Request 和 Response 日志包含相同的进程内 `Request-ID`，不会将该 ID 注入实际 HTTP Header。`Headers-Duration` 表示发送开始到收到响应头的耗时（包括重定向）；`Body-Duration` 表示返回响应头后到 Body EOF/Close 的耗时，包含调用方暂停读取的时间；`Duration` 为总耗时。Body 未读取或关闭时，不会提前输出其完成日志。
+
+业务自定义脱敏规则（重复配置累积，名称大小写不敏感，内置规则仍生效）：
+
+```go
+client := req.New(
+    req.WithDebug(true),
+    req.WithDebugRedactHeaders("X-Business-Identity"),
+    req.WithDebugRedactQuery("customer_id"),
+    req.WithDebugRedactJSONFields("phone", "address"),
+)
+```
+
+JSON 字段在任意嵌套深度匹配；启用 JSON 字段脱敏后，截断、不完整或无效 JSON 会整段省略，避免部分内容泄露。规则仅作用于日志副本，不改变真实请求/响应。JSON 字段规则不作用于非 JSON Body，敏感表单等内容仍应关闭 Body 日志。
 
 输出包含：
 
@@ -490,10 +561,11 @@ type StatusError struct {
     Status     string
     Header     http.Header
     Body       []byte
+    BodyTruncated bool
 }
 ```
 
-错误响应的 Body 最多保留 64 KiB，避免恶意服务端造成内存问题。该截断不属于错误。
+错误响应的 Body 最多保留 64 KiB，避免恶意服务端造成内存问题。超过时 BodyTruncated 为 true；恰好等于上限为 false。该截断不属于错误。如果读取本身失败，错误链同时保留 StatusError 和底层读取错误；BodyTruncated 为 false 不代表读取一定完成，应同时检查错误链。
 
 其他常用判断：
 
@@ -595,6 +667,9 @@ type Option func(*Client) error
 | `WithDebugWriter` | 设置 Debug 输出目标；默认 `os.Stdout` |
 | `WithDebugBody` | 开启或关闭 Body 捕获；Debug 开启时默认开启 |
 | `WithDebugMaxBodySize` | 设置单个请求/响应 Body 的 Debug 捕获上限；默认 64 KiB |
+| `WithDebugRedactHeaders` | 累积业务 Header 脱敏名称，大小写不敏感 |
+| `WithDebugRedactQuery` | 累积业务 Query 脱敏名称，大小写不敏感 |
+| `WithDebugRedactJSONFields` | 累积 JSON 字段脱敏名称；匹配任意嵌套深度，不完整 JSON 整段省略 |
 
 冲突检测与 Option 顺序无关。配置错误不会 panic：
 
@@ -650,6 +725,12 @@ client = configured
 - Fragment 会保留。
 - 没有 BaseURL 时使用相对路径，会在 `Build`/`Do` 时返回 `ErrNoBaseURL`。
 
+## BaseURL 与认证安全
+
+BaseURL 只是 URL 解析前缀，**不是域名白名单或 SSRF 防护**。绝对 URL 和 `//host/path` 可以切换目标主机，Builder 默认 Header（包括 Authorization）也会应用到该目标。不要把不可信 URL 直接交给带默认凭据的 Client；必要时在 Build 后校验 scheme、主机、端口，再发送。
+
+标准库的重定向处理不等同于严格同源策略；高安全场景应自行配置 `http.Client.CheckRedirect`，检查每一跳。本文新增功能不会引入隐式同源限制或改变标准库行为。
+
 ## 与 net/http 的设计关系
 
 `go-req` 只增加请求构建便利性：
@@ -699,6 +780,10 @@ client := req.New(req.WithTransport(transport))
 go test ./...
 go test -race ./...
 go vet ./...
+go test -run '^$' -bench . -benchmem ./...
+go test -run '^$' -fuzz '^FuzzResolveURL$' -fuzztime 10s
+go test -run '^$' -fuzz '^FuzzProxyConfiguration$' -fuzztime 10s
+go test -run '^$' -fuzz '^FuzzDebugRedaction$' -fuzztime 10s
 ```
 
-测试仅使用标准库 `testing` 与 `httptest`，不依赖公网服务。
+测试仅使用标准库 `testing` 与 `httptest`，不依赖公网服务。CI 在 Go 1.21 和当前稳定版执行测试、race 检测和 vet，并在稳定版运行短时间 Fuzz。Benchmark 对比原生请求构造与 Builder，并测量 JSON 和 Debug 的分配开销；响应 Benchmark 使用本地 RoundTripper，不代表真实网络性能。

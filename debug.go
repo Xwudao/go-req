@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -20,10 +21,13 @@ import (
 const DefaultDebugMaxBodySize int64 = 64 << 10
 
 type debugConfig struct {
-	enabled     bool
-	writer      io.Writer
-	body        bool
-	maxBodySize int64
+	enabled       bool
+	writer        io.Writer
+	body          bool
+	maxBodySize   int64
+	redactHeaders []string
+	redactQuery   []string
+	redactJSON    []string
 }
 
 func newDebugConfig() debugConfig {
@@ -130,12 +134,14 @@ func (c *Client) writeDebug(output string) {
 func (c *Client) doDebug(req *http.Request) (*http.Response, error) {
 	cfg := c.debug
 	start := time.Now()
+	id := debugSequence.Add(1)
+	write := func(output string) { c.writeDebug(fmt.Sprintf("Request-ID: %d\n", id) + output) }
 	hasRequestBody := req.Body != nil && req.Body != http.NoBody
 
 	var requestCapture *debugCapture
 	sendReq := req
 	logRequest := func(snapshot debugBodySnapshot) {
-		c.writeDebug(formatDebugRequest(req, snapshot, hasRequestBody, cfg.body))
+		write(formatDebugRequest(redactConfiguredRequest(req, cfg), redactConfiguredBody(req.Header.Get("Content-Type"), snapshot, cfg), hasRequestBody, cfg.body))
 	}
 
 	if cfg.body && hasRequestBody {
@@ -153,36 +159,39 @@ func (c *Client) doDebug(req *http.Request) (*http.Response, error) {
 	}
 
 	resp, err := c.httpClient.Do(sendReq)
+	headerDuration := time.Since(start)
 	if requestCapture != nil {
 		// Custom RoundTrippers are not required to read or close the body.
 		requestCapture.finish()
 	}
 	if err != nil {
-		c.writeDebug(formatDebugResponseError(err, time.Since(start)))
+		write(formatDebugResponseError(redactConfiguredError(err, cfg), time.Since(start)))
 		return nil, err
 	}
 	if resp == nil {
 		err := errors.New("req: HTTP client returned a nil response")
-		c.writeDebug(formatDebugResponseError(err, time.Since(start)))
+		write(formatDebugResponseError(err, time.Since(start)))
 		return nil, err
 	}
 	if !cfg.body {
-		c.writeDebug(formatDebugResponse(resp, debugBodySnapshot{}, false, time.Since(start)))
+		write(formatDebugResponse(redactConfiguredResponse(resp, cfg), debugBodySnapshot{}, false, time.Since(start)) + fmt.Sprintf("Headers-Duration: %s\n", headerDuration))
 		return resp, nil
 	}
 	if resp.Body == nil || resp.Body == http.NoBody {
-		c.writeDebug(formatDebugResponse(resp, debugBodySnapshot{}, true, time.Since(start)))
+		write(formatDebugResponse(redactConfiguredResponse(resp, cfg), debugBodySnapshot{}, true, time.Since(start)) + fmt.Sprintf("Headers-Duration: %s\n", headerDuration))
 		return resp, nil
 	}
 
 	resp.Body = &debugReadCloser{
 		ReadCloser: resp.Body,
 		capture: newDebugCapture(cfg.maxBodySize, func(snapshot debugBodySnapshot) {
-			c.writeDebug(formatDebugResponse(resp, snapshot, true, time.Since(start)))
+			write(formatDebugResponse(redactConfiguredResponse(resp, cfg), redactConfiguredBody(resp.Header.Get("Content-Type"), snapshot, cfg), true, time.Since(start)) + fmt.Sprintf("Headers-Duration: %s\nBody-Duration: %s\n", headerDuration, time.Since(start)-headerDuration))
 		}),
 	}
 	return resp, nil
 }
+
+var debugSequence atomic.Uint64
 
 type debugBodySnapshot struct {
 	Data      []byte

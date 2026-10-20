@@ -1,0 +1,32 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        go: ['1.21.x', 'stable']
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - run: go test ./...
+      - run: go test -race ./...
+      - run: go vet ./...
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - run: go test -run '^$' -fuzz '^FuzzResolveURL$' -fuzztime 10s
+      - run: go test -run '^$' -fuzz '^FuzzProxyConfiguration$' -fuzztime 10s
+      - run: go test -run '^$' -fuzz '^FuzzDebugRedaction$' -fuzztime 10s

@@ -1,6 +1,7 @@
 package req
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,8 @@ type StatusError struct {
 	Status     string
 	Header     http.Header
 	Body       []byte
+	// BodyTruncated reports whether Body exceeded the error capture limit.
+	BodyTruncated bool
 }
 
 // Error implements error.
@@ -47,7 +50,27 @@ func (r *Request) ToJSON(v any) error {
 	if len(data) == 0 {
 		return nil
 	}
-	if err := json.Unmarshal(data, v); err != nil {
+	if !r.jsonUseNumber && !r.jsonStrict {
+		if err := json.Unmarshal(data, v); err != nil {
+			return fmt.Errorf("req: decode JSON response: %w", err)
+		}
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if r.jsonUseNumber {
+		decoder.UseNumber()
+	}
+	if r.jsonStrict {
+		decoder.DisallowUnknownFields()
+	}
+	// Check the complete document before decoding so trailing data cannot
+	// silently succeed or partially modify v (matching Unmarshal semantics).
+	if !json.Valid(data) {
+		var discard any
+		err := json.Unmarshal(data, &discard)
+		return fmt.Errorf("req: decode JSON response: %w", err)
+	}
+	if err := decoder.Decode(v); err != nil {
 		return fmt.Errorf("req: decode JSON response: %w", err)
 	}
 	return nil
@@ -87,25 +110,15 @@ func (r *Request) responseBytes() ([]byte, error) {
 	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, _, readErr := readLimited(resp.Body, maxErrorBodyBytes)
-		statusErr := &StatusError{
-			StatusCode: resp.StatusCode,
-			Status:     resp.Status,
-			Header:     resp.Header.Clone(),
-			Body:       body,
-		}
-		if readErr != nil {
-			return nil, errors.Join(
-				statusErr,
-				fmt.Errorf("req: read error response body: %w", readErr),
-			)
-		}
-		return nil, statusErr
+		return nil, responseStatusError(resp)
 	}
 
 	limit := DefaultMaxResponseBytes
 	if r.client != nil && r.client.maxResponseBytes > 0 {
 		limit = r.client.maxResponseBytes
+	}
+	if r.maxResponseBytes > 0 {
+		limit = r.maxResponseBytes
 	}
 	body, truncated, err := readLimited(resp.Body, limit)
 	if err != nil {
@@ -122,11 +135,8 @@ func readLimited(reader io.Reader, limit int64) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	data, err := io.ReadAll(io.LimitReader(reader, limit+1))
-	if err != nil {
-		return data, false, err
-	}
 	if int64(len(data)) > limit {
-		return data[:limit], true, nil
+		return data[:limit], true, err
 	}
-	return data, false, nil
+	return data, false, err
 }

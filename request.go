@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -15,8 +16,8 @@ import (
 // Request is a mutable request builder created by a Client.
 //
 // Builder methods record the first construction error and never panic on
-// invalid input. The error is returned by Build, Do, ToJSON, ToBytes, or
-// ToString. A Request must not be modified by multiple goroutines
+// invalid input. The error is returned by Build, Do, ToJSON, ToBytes,
+// ToString, or ToWriter. A Request must not be modified by multiple goroutines
 // concurrently.
 //
 // JSON and Form bodies are encoded when their method is called, so they can be
@@ -34,6 +35,10 @@ type Request struct {
 
 	body        io.Reader
 	bodyFactory func() io.Reader
+
+	maxResponseBytes int64
+	jsonUseNumber    bool
+	jsonStrict       bool
 
 	debugSet bool
 	debug    bool
@@ -177,6 +182,29 @@ func (r *Request) Body(body io.Reader) *Request {
 	}
 	r.body = body
 	r.bodyFactory = nil
+	return r
+}
+
+// MaxResponseBytes overrides the buffered response limit for this request.
+// It does not limit Do or ToWriter. n must be positive and less than MaxInt64.
+func (r *Request) MaxResponseBytes(n int64) *Request {
+	if n <= 0 || n == math.MaxInt64 {
+		r.setErr(configError("maximum response size must be positive and less than MaxInt64"))
+	} else {
+		r.maxResponseBytes = n
+	}
+	return r
+}
+
+// UseNumber preserves JSON numbers when decoding into interface values.
+func (r *Request) UseNumber(enabled bool) *Request {
+	r.jsonUseNumber = enabled
+	return r
+}
+
+// DisallowUnknownFields rejects JSON object fields absent from the target struct.
+func (r *Request) DisallowUnknownFields(enabled bool) *Request {
+	r.jsonStrict = enabled
 	return r
 }
 
