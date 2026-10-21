@@ -745,7 +745,13 @@ BaseURL 只是 URL 解析前缀，**不是域名白名单或 SSRF 防护**。绝
 
 ## 浏览器指纹扩展
 
-浏览器 TLS/HTTP2 指纹模拟由独立模块 [`go-req-impersonate`](https://github.com/Xwudao/go-req-impersonate) 提供。核心库不依赖 uTLS、tls-client 或 fhttp，也不需要为此修改 `net/http` 兼容层。
+浏览器 TLS/HTTP2 指纹模拟由独立模块 [`go-req-ext/impersonate`](https://github.com/Xwudao/go-req-ext/tree/main/impersonate) 提供：
+
+```bash
+go get github.com/Xwudao/go-req-ext/impersonate
+```
+
+核心库不依赖 uTLS、tls-client 或 fhttp，也不需要为此修改 `net/http` 兼容层。
 
 ```go
 transport, err := impersonate.New(
@@ -767,6 +773,8 @@ client := req.New(req.WithTransport(transport))
 - 需要关闭空闲连接时调用 `transport.CloseIdleConnections()`。
 
 指纹模拟不等于完整浏览器环境，也不保证绕过任何网站的检测。具体 Profile 版本、代理边界和限制请阅读该模块 README。
+
+Cookie 管理与持久化由同一扩展仓库的 [`go-req-ext/jar`](https://github.com/Xwudao/go-req-ext/tree/main/jar) 提供，只依赖标准库；使用 `jar` 不会链接指纹模块。
 
 ## 第一版暂不包含
 
