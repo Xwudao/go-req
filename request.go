@@ -39,6 +39,7 @@ type Request struct {
 	maxResponseBytes int64
 	jsonUseNumber    bool
 	jsonStrict       bool
+	errorJSONTarget  any
 
 	debugSet bool
 	debug    bool
@@ -205,6 +206,33 @@ func (r *Request) UseNumber(enabled bool) *Request {
 // DisallowUnknownFields rejects JSON object fields absent from the target struct.
 func (r *Request) DisallowUnknownFields(enabled bool) *Request {
 	r.jsonStrict = enabled
+	return r
+}
+
+// ErrorJSON sets a target that receives the decoded JSON body of a non-2xx
+// response.
+//
+// It lets an API use one JSON shape for successful responses and another for
+// errors. The target is only touched by ToJSON, ToBytes, ToString, and
+// ToWriter when the response status is outside 2xx; successful responses leave
+// it unchanged. An empty error body also leaves it unchanged.
+//
+// The raw error body remains available in *StatusError, bounded to 64 KiB. If
+// decoding fails, the returned error still exposes *StatusError and also
+// matches ErrErrorBodyDecode. Decoding ignores DisallowUnknownFields; UseNumber
+// is honored for interface or json.Number targets.
+//
+// Do never reads or decodes the response body, so ErrorJSON does not apply to
+// the raw Do path.
+func (r *Request) ErrorJSON(v any) *Request {
+	if r.err != nil {
+		return r
+	}
+	if v == nil {
+		r.setErr(errors.New("req: ErrorJSON target must not be nil"))
+		return r
+	}
+	r.errorJSONTarget = v
 	return r
 }
 

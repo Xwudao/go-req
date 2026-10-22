@@ -27,7 +27,7 @@ func (r *Request) ToWriter(dst io.Writer) (int64, error) {
 		defer resp.Body.Close()
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return 0, responseStatusError(resp)
+		return 0, r.errorFromResponse(resp)
 	}
 	if resp.Body == nil {
 		return 0, nil
@@ -39,12 +39,19 @@ func (r *Request) ToWriter(dst io.Writer) (int64, error) {
 	return n, nil
 }
 
-func responseStatusError(resp *http.Response) error {
+// errorFromResponse reads the bounded error body, applies any ErrorJSON target,
+// and preserves the HTTP status in the returned error chain.
+func (r *Request) errorFromResponse(resp *http.Response) error {
+	statusErr, readErr := readStatusError(resp)
+	return r.statusError(statusErr, readErr)
+}
+
+func readStatusError(resp *http.Response) (*StatusError, error) {
 	body, truncated, err := readLimited(resp.Body, maxErrorBodyBytes)
 	statusErr := &StatusError{StatusCode: resp.StatusCode, Status: resp.Status,
 		Header: resp.Header.Clone(), Body: body, BodyTruncated: truncated}
 	if err != nil {
-		return errors.Join(statusErr, fmt.Errorf("req: read error response body: %w", err))
+		return statusErr, fmt.Errorf("req: read error response body: %w", err)
 	}
-	return statusErr
+	return statusErr, nil
 }

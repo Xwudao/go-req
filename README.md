@@ -444,6 +444,110 @@ err = client.Get(ctx, "/user").DisallowUnknownFields(true).ToJSON(&user)
 
 两项可组合，仍只接受单个完整 JSON 文档，不接受尾随内容。
 
+### 错误响应 JSON
+
+很多 API 的成功响应和错误响应使用不同的 JSON 结构。可以用
+`ErrorJSON` 为错误响应指定解码目标，同时用 `ToJSON` 解码成功响应：
+
+```go
+type APIError struct {
+    Code    int    `json:"code"`
+    Message string `json:"message"`
+}
+
+var user User
+var apiErr APIError
+
+err := client.Get(ctx, "/users/1").
+    ErrorJSON(&apiErr).
+    ToJSON(&user)
+
+var statusErr *req.StatusError
+if errors.As(err, &statusErr) {
+    fmt.Println(statusErr.StatusCode, apiErr.Code, apiErr.Message)
+}
+```
+
+语义：
+
+- `ErrorJSON` 只影响非 2xx 响应；2xx 不会修改目标。
+- 空错误 Body 不会修改目标，也不返回解码错误。
+- 原始错误 Body 仍保存在 `StatusError.Body` 中，最多 64 KiB。
+- 错误 JSON 解码失败不会隐藏 HTTP 状态：错误链同时包含 `*StatusError`
+  和 `req.ErrErrorBodyDecode`，可用 `errors.As` / `errors.Is` 检查。
+- 错误 Body 解码忽略 `DisallowUnknownFields`；`UseNumber` 对
+  `map[string]any` 或 `json.Number` 目标仍然生效。
+- `ErrorJSON` 适用于 `ToJSON`、`ToBytes`、`ToString` 和 `ToWriter`。
+  原生 `Do` 不读取 Body，因此不会应用该设置。
+
+如果不想在发送前指定目标，也可以在拿到 `StatusError` 后解码：
+
+```go
+var apiErr APIError
+if err := statusErr.DecodeJSON(&apiErr); err != nil {
+    // 错误 Body 为空时返回 nil 且不修改目标。
+}
+```
+
+## 泛型方法
+
+Go 1.27 起支持泛型方法，泛型能力直接挂在 Builder 上：
+
+```go
+user, err := client.Get(ctx, "/users/1").Decode[User]()
+```
+
+需要区分“空响应”和“解码出的零值”时使用 `DecodePtr`：
+
+```go
+user, err := client.Get(ctx, "/users/1").DecodePtr[User]()
+// 204 No Content 时 user == nil，err == nil。
+```
+
+成功和错误响应结构不同时，使用 `DecodeWithError`，把错误 Body 解码到
+泛型错误类型：
+
+```go
+user, err := client.Get(ctx, "/users/1").DecodeWithError[User, APIError]()
+
+var apiErr *req.TypedStatusError[APIError]
+if errors.As(err, &apiErr) {
+    fmt.Println(apiErr.StatusCode)   // 400
+    fmt.Println(apiErr.Data.Code)    // 40001
+    fmt.Println(apiErr.Data.Message) // bad request
+    fmt.Println(string(apiErr.Body)) // 原始错误 Body
+}
+```
+
+`TypedStatusError[T]` 内嵌 `StatusError`，因此 `StatusCode`、`Status`、
+`Header`、`Body`、`BodyTruncated` 和 `DecodeJSON` 可直接使用；
+`errors.As(err, &statusErr)` 仍然可以得到 `*req.StatusError`。
+错误 Body 无法解码时 `Data` 保持零值，`DecodeErr` 非空且错误链匹配
+`ErrErrorBodyDecode`；读取失败时 `ReadErr` 非空。
+
+`DecodeWithError` 使用自己的类型参数 `E`，不会使用 Builder 上通过
+`ErrorJSON` 设置的目标。需要复用同一个错误目标时，使用非泛型写法
+`ErrorJSON(&apiErr).ToJSON(&result)`。
+
+泛型方法与普通方法遵循相同规则：非 2xx 返回状态错误（`DecodeWithError`
+返回 `TypedStatusError`，其余方法返回 `StatusError`），空 Body 不修改目标，
+成功 Body 受 `WithMaxResponseBytes` / `MaxResponseBytes` 限制，JSON 解码受
+`UseNumber` 和 `DisallowUnknownFields` 影响。
+
+### Go 1.21～1.26 兼容写法
+
+泛型方法是 Go 1.27 新增的语言特性。模块的最低版本仍是 Go 1.21，因此
+`Decode` 系列方法只在 Go 1.27 及以上可用。较低版本可以使用等价的
+package-level 函数：
+
+```go
+user, err := req.ToJSON[User](client.Get(ctx, "/users/1"))
+user, err := req.ToJSONPtr[User](client.Get(ctx, "/users/1"))
+user, err := req.ToJSONWithError[User, APIError](client.Get(ctx, "/users/1"))
+```
+
+两者语义完全一致，只是调用形式和最低 Go 版本不同。
+
 ## Debug
 
 Debug 默认关闭。开启后默认写入 `os.Stdout`：
@@ -563,6 +667,9 @@ type StatusError struct {
     Body       []byte
     BodyTruncated bool
 }
+
+// DecodeJSON 将捕获的错误 Body 解码到 v。
+func (e *StatusError) DecodeJSON(v any) error
 ```
 
 错误响应的 Body 最多保留 64 KiB，避免恶意服务端造成内存问题。超过时 BodyTruncated 为 true；恰好等于上限为 false。该截断不属于错误。如果读取本身失败，错误链同时保留 StatusError 和底层读取错误；BodyTruncated 为 false 不代表读取一定完成，应同时检查错误链。
@@ -571,6 +678,7 @@ type StatusError struct {
 
 ```go
 errors.Is(err, req.ErrResponseTooLarge)
+errors.Is(err, req.ErrErrorBodyDecode)
 errors.Is(err, req.ErrNoBaseURL)
 errors.Is(err, req.ErrConfiguration)
 errors.Is(err, context.Canceled)
@@ -778,7 +886,7 @@ Cookie 管理与持久化由同一扩展仓库的 [`go-req-ext/jar`](https://git
 
 ## 第一版暂不包含
 
-自动重试、HTTP 缓存、WebSocket、SSE 专用抽象、Cookie 持久化封装、自动限流、熔断器、复杂 Middleware、服务发现、泛型 DSL、内置日志框架。
+自动重试、HTTP 缓存、WebSocket、SSE 专用抽象、Cookie 持久化封装、自动限流、熔断器、复杂 Middleware、服务发现、复杂泛型 DSL、内置日志框架。
 
 这些能力可以通过 `http.RoundTripper`、`http.Client` 或独立模块组合实现。
 
@@ -794,4 +902,4 @@ go test -run '^$' -fuzz '^FuzzProxyConfiguration$' -fuzztime 10s
 go test -run '^$' -fuzz '^FuzzDebugRedaction$' -fuzztime 10s
 ```
 
-测试仅使用标准库 `testing` 与 `httptest`，不依赖公网服务。CI 在 Go 1.21 和当前稳定版执行测试、race 检测和 vet，并在稳定版运行短时间 Fuzz。Benchmark 对比原生请求构造与 Builder，并测量 JSON 和 Debug 的分配开销；响应 Benchmark 使用本地 RoundTripper，不代表真实网络性能。
+测试仅使用标准库 `testing` 与 `httptest`，不依赖公网服务。CI 在 Go 1.21 和当前稳定版执行测试、race 检测和 vet，并在稳定版运行短时间 Fuzz。泛型方法测试使用 `//go:build go1.27`，只在 Go 1.27 及以上的工具链执行。Benchmark 对比原生请求构造与 Builder，并测量 JSON 和 Debug 的分配开销；响应 Benchmark 使用本地 RoundTripper，不代表真实网络性能。
