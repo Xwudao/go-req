@@ -502,7 +502,13 @@ func TestTimeout(t *testing.T) {
 		t.Fatal("expected timeout")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err = %v, want DeadlineExceeded", err)
+		// Go 1.21 and 1.22's http.Client.Timeout does not unwrap to
+		// context.DeadlineExceeded. Accept the standard net.Error timeout
+		// classification so the test covers all supported Go versions.
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("err = %v, want context.DeadlineExceeded or net.Error.Timeout", err)
+		}
 	}
 }
 

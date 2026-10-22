@@ -685,6 +685,18 @@ errors.Is(err, context.Canceled)
 errors.Is(err, context.DeadlineExceeded)
 ```
 
+`WithTimeout` 底层是 `http.Client.Timeout`。Go 1.23 起，超时错误同时满足
+`errors.Is(err, context.DeadlineExceeded)`；Go 1.21 与 1.22 的超时错误只提供
+`net.Error.Timeout()`。需要兼容多个 Go 版本时可同时检查：
+
+```go
+var netErr net.Error
+if errors.Is(err, context.DeadlineExceeded) ||
+    (errors.As(err, &netErr) && netErr.Timeout()) {
+    // timeout
+}
+```
+
 HTTP 404/500 不会被伪装成网络错误；连接失败则会保留底层 `*url.Error` 链。
 
 ## Context 与 Timeout
