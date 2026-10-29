@@ -1,3 +1,3 @@
 module github.com/Xwudao/go-req
 
-go 1.21
+go 1.27

@@ -13,7 +13,7 @@ import (
 	"github.com/Xwudao/go-req"
 )
 
-func TestStatusError(t *testing.T) {
+func TestResponseErrorStatus(t *testing.T) {
 	tests := []int{http.StatusBadRequest, http.StatusNotFound, http.StatusInternalServerError}
 	for _, status := range tests {
 		status := status
@@ -26,14 +26,13 @@ func TestStatusError(t *testing.T) {
 			defer srv.Close()
 
 			client := req.New(req.WithBaseURL(srv.URL))
-			var result map[string]any
-			err := client.Get(context.Background(), "/error").ToJSON(&result)
+			_, err := client.Get(context.Background(), "/error").ToJSON[map[string]any]()
 			if err == nil {
 				t.Fatal("expected error")
 			}
-			var statusErr *req.StatusError
+			var statusErr *req.ResponseError
 			if !errors.As(err, &statusErr) {
-				t.Fatalf("err = %T, want *StatusError", err)
+				t.Fatalf("err = %T, want *ResponseError", err)
 			}
 			if statusErr.StatusCode != status {
 				t.Errorf("StatusCode = %d, want %d", statusErr.StatusCode, status)
@@ -64,9 +63,9 @@ func TestStatusErrorBodyIsLimited(t *testing.T) {
 
 	client := req.New(req.WithBaseURL(srv.URL))
 	_, err := client.Get(context.Background(), "/error").ToBytes()
-	var statusErr *req.StatusError
+	var statusErr *req.ResponseError
 	if !errors.As(err, &statusErr) {
-		t.Fatalf("err = %v, want *StatusError", err)
+		t.Fatalf("err = %v, want *ResponseError", err)
 	}
 	if len(statusErr.Body) != 64<<10 {
 		t.Fatalf("Body length = %d, want %d", len(statusErr.Body), 64<<10)
@@ -93,8 +92,7 @@ func TestSuccessfulResponseLimit(t *testing.T) {
 		t.Fatalf("err = %v, want ErrResponseTooLarge", err)
 	}
 
-	var out any
-	if err := client.Get(ctx, "/").ToJSON(&out); !errors.Is(err, req.ErrResponseTooLarge) {
+	if _, err := client.Get(ctx, "/").ToJSON[any](); !errors.Is(err, req.ErrResponseTooLarge) {
 		t.Fatalf("ToJSON err = %v, want ErrResponseTooLarge", err)
 	}
 }
@@ -121,14 +119,19 @@ func TestToJSONEmptyBody(t *testing.T) {
 		}))
 		defer srv.Close()
 		client := req.New(req.WithBaseURL(srv.URL))
-		value := struct {
+		type named struct {
 			Name string `json:"name"`
-		}{Name: "unchanged"}
-		if err := client.Get(context.Background(), "/").ToJSON(&value); err != nil {
+		}
+		value, err := client.Get(context.Background(), "/").ToJSON[named]()
+		if err != nil {
 			t.Fatalf("ToJSON: %v", err)
 		}
-		if value.Name != "unchanged" {
+		if value != (named{}) {
 			t.Fatalf("value = %+v", value)
+		}
+		ptr, err := client.Get(context.Background(), "/").ToJSON[*named]()
+		if err != nil || ptr != nil {
+			t.Fatalf("pointer = %+v, %v", ptr, err)
 		}
 	})
 
@@ -138,8 +141,8 @@ func TestToJSONEmptyBody(t *testing.T) {
 		}))
 		defer srv.Close()
 		client := req.New(req.WithBaseURL(srv.URL))
-		var value any
-		if err := client.Get(context.Background(), "/").ToJSON(&value); err != nil {
+		value, err := client.Get(context.Background(), "/").ToJSON[any]()
+		if err != nil {
 			t.Fatalf("ToJSON: %v", err)
 		}
 		if value != nil {
@@ -155,10 +158,10 @@ func TestToJSONNull(t *testing.T) {
 	defer srv.Close()
 	client := req.New(req.WithBaseURL(srv.URL))
 
-	value := &struct {
+	value, err := client.Get(context.Background(), "/").ToJSON[*struct {
 		Name string `json:"name"`
-	}{Name: "set"}
-	if err := client.Get(context.Background(), "/").ToJSON(&value); err != nil {
+	}]()
+	if err != nil {
 		t.Fatalf("ToJSON: %v", err)
 	}
 	if value != nil {
@@ -174,8 +177,7 @@ func TestToJSONDecodeError(t *testing.T) {
 	defer srv.Close()
 
 	client := req.New(req.WithBaseURL(srv.URL))
-	var value any
-	err := client.Get(context.Background(), "/").ToJSON(&value)
+	_, err := client.Get(context.Background(), "/").ToJSON[any]()
 	if err == nil {
 		t.Fatal("expected decode error")
 	}
@@ -185,9 +187,10 @@ func TestToJSONDecodeError(t *testing.T) {
 	}
 }
 
-func TestToJSONNilTarget(t *testing.T) {
-	if err := req.New().Get(context.Background(), "https://example.com").ToJSON(nil); err == nil {
-		t.Fatal("expected error for nil target")
+func TestToJSONNilRequest(t *testing.T) {
+	var r *req.Request
+	if _, err := r.ToJSON[any](); err == nil {
+		t.Fatal("expected error for nil request")
 	}
 }
 
@@ -269,8 +272,8 @@ func TestResponseHelpersCloseBody(t *testing.T) {
 			status: http.StatusOK,
 			body:   `{"ok":true}`,
 			call: func(r *req.Request) error {
-				var v any
-				return r.ToJSON(&v)
+				_, err := r.ToJSON[any]()
+				return err
 			},
 		},
 		{
@@ -278,8 +281,8 @@ func TestResponseHelpersCloseBody(t *testing.T) {
 			status: http.StatusOK,
 			body:   `{bad`,
 			call: func(r *req.Request) error {
-				var v any
-				return r.ToJSON(&v)
+				_, err := r.ToJSON[any]()
+				return err
 			},
 		},
 		{
@@ -356,9 +359,9 @@ func TestStatusErrorWithReadError(t *testing.T) {
 		}, nil
 	})))
 	_, err := client.Get(context.Background(), "https://example.com").ToBytes()
-	var statusErr *req.StatusError
+	var statusErr *req.ResponseError
 	if !errors.As(err, &statusErr) {
-		t.Fatalf("err = %v, want StatusError", err)
+		t.Fatalf("err = %v, want ResponseError", err)
 	}
 	if !errors.Is(err, errReadFailure) {
 		t.Fatalf("err = %v, want read failure in chain", err)
@@ -396,10 +399,10 @@ func TestSuccessfulStatusWithoutJSONContentType(t *testing.T) {
 	}))
 	defer srv.Close()
 	client := req.New(req.WithBaseURL(srv.URL))
-	var out struct {
+	out, err := client.Get(context.Background(), "/").ToJSON[struct {
 		Value int `json:"value"`
-	}
-	if err := client.Get(context.Background(), "/").ToJSON(&out); err != nil {
+	}]()
+	if err != nil {
 		t.Fatalf("ToJSON: %v", err)
 	}
 	if out.Value != 42 {
@@ -413,11 +416,10 @@ func TestStatusErrorForNon2xxWithoutBody(t *testing.T) {
 	}))
 	defer srv.Close()
 	client := req.New(req.WithBaseURL(srv.URL))
-	var out any
-	err := client.Get(context.Background(), "/").ToJSON(&out)
-	var statusErr *req.StatusError
+	_, err := client.Get(context.Background(), "/").ToJSON[any]()
+	var statusErr *req.ResponseError
 	if !errors.As(err, &statusErr) {
-		t.Fatalf("err = %v, want *StatusError", err)
+		t.Fatalf("err = %v, want *ResponseError", err)
 	}
 	if statusErr.StatusCode != http.StatusNotModified {
 		t.Fatalf("StatusCode = %d", statusErr.StatusCode)

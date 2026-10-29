@@ -7,76 +7,159 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 )
 
-// StatusError is returned by ToJSON, ToBytes, and ToString when the server
-// responds with a status outside the 2xx range.
+// Response is a buffered HTTP response passed to an ErrorCheck and embedded in
+// ResponseError.
 //
-// Body contains at most 64 KiB of the response body. It is not an error for the
-// body to be truncated; the cap protects against unbounded error payloads.
-type StatusError struct {
+// For a 2xx response, Body is the complete body, bounded by the response size
+// limit. For other statuses, Body contains at most 64 KiB and BodyTruncated
+// reports whether more data was discarded.
+type Response struct {
 	StatusCode int
 	Status     string
 	Header     http.Header
 	Body       []byte
-	// BodyTruncated reports whether Body exceeded the error capture limit.
+	// BodyTruncated reports whether a non-2xx Body exceeded the capture limit.
 	BodyTruncated bool
 }
 
+// IsSuccess reports whether the status code is in the 2xx range.
+func (r *Response) IsSuccess() bool {
+	return r.StatusCode >= 200 && r.StatusCode <= 299
+}
+
+// ErrorCheck decides whether a buffered response is an API error.
+//
+// It is called for every response read by ToJSON, ToBytes, and ToString, and
+// for non-2xx responses read by ToWriter. Returning a non-nil error makes the
+// call fail with a *ResponseError whose Err is that error, even for a 2xx
+// response. Returning nil keeps the default behavior: 2xx succeeds and any
+// other status fails with a *ResponseError whose Err is nil.
+//
+// The check must not retain or modify resp.Body after it returns.
+type ErrorCheck func(resp *Response) error
+
+// JSONError returns an ErrorCheck for APIs whose error payload is a JSON
+// object of type E, possibly sent with a 2xx status.
+//
+// For every non-empty body that decodes into E, isError is called with the
+// response and the decoded value; when it reports true, the value becomes
+// ResponseError.Err and can be retrieved with errors.As. Bodies that do not
+// decode into E are left to the default status handling. Decoding ignores
+// DisallowUnknownFields and does not use UseNumber. A nil isError returns a nil
+// ErrorCheck, which WithErrorCheck rejects.
+//
+// E is usually a value type with an Error method:
+//
+//	type APIError struct {
+//	    Code int    `json:"code"`
+//	    Msg  string `json:"msg"`
+//	}
+//
+//	func (e APIError) Error() string { return fmt.Sprintf("%d: %s", e.Code, e.Msg) }
+//
+//	check := req.JSONError(func(resp *req.Response, e APIError) bool {
+//	    return e.Code != 0
+//	})
+func JSONError[E error](isError func(resp *Response, e E) bool) ErrorCheck {
+	if isError == nil {
+		return nil
+	}
+	return func(resp *Response) error {
+		body := bytes.TrimSpace(resp.Body)
+		if len(body) == 0 || bytes.Equal(body, []byte("null")) {
+			return nil
+		}
+		var e E
+		if json.Unmarshal(body, &e) != nil {
+			return nil
+		}
+		if !isError(resp, e) {
+			return nil
+		}
+		return e
+	}
+}
+
+// ResponseError is returned when a response is an error, either because its
+// status is outside 2xx or because an ErrorCheck reported one.
+//
+// Err holds the error returned by the ErrorCheck and is nil for a non-2xx
+// response that the check did not classify. Unwrap exposes Err, so the API
+// error type can be retrieved directly with errors.As.
+type ResponseError struct {
+	Response
+	Err error
+}
+
 // Error implements error.
-func (e *StatusError) Error() string {
-	if e.Status != "" {
-		return fmt.Sprintf("req: unexpected HTTP status: %s", e.Status)
+func (e *ResponseError) Error() string {
+	status := e.Status
+	if status == "" {
+		status = strconv.Itoa(e.StatusCode)
 	}
-	return fmt.Sprintf("req: unexpected HTTP status: %d", e.StatusCode)
+	if e.Err != nil {
+		return fmt.Sprintf("req: API error (HTTP %s): %v", status, e.Err)
+	}
+	return fmt.Sprintf("req: unexpected HTTP status: %s", status)
 }
 
-// DecodeJSON decodes the captured error body into v.
-//
-// An empty body succeeds and leaves v unchanged. Decoding does not use the
-// UseNumber or DisallowUnknownFields request options. If Body was truncated,
-// decoding will usually fail; check BodyTruncated to distinguish that case.
-func (e *StatusError) DecodeJSON(v any) error {
-	if e == nil {
-		return errors.New("req: nil status error")
-	}
-	if v == nil {
-		return errors.New("req: DecodeJSON target must not be nil")
-	}
-	if len(e.Body) == 0 {
-		return nil
-	}
-	return decodeErrorJSON(e.Body, v, false)
+// Unwrap returns Err.
+func (e *ResponseError) Unwrap() error {
+	return e.Err
 }
 
-// ToJSON sends the request, requires a 2xx status, decodes the response body as
-// JSON into v, and closes the body.
+// ToJSON sends the request, requires a successful response, and decodes the
+// JSON body into T. It closes the body.
 //
-// An empty body, including a 204 No Content response, is treated as success and
-// leaves v unchanged. A JSON null is decoded normally by encoding/json.
+// An empty body, including a 204 No Content response, returns the zero value
+// of T without an error. Use a pointer type to distinguish it from a decoded
+// zero value: ToJSON[*User] returns nil for an empty body.
 //
-// Non-2xx responses return *StatusError. Network, read, and decode errors are
-// returned with their original error chain intact.
-func (r *Request) ToJSON(v any) error {
-	if v == nil {
-		return errors.New("req: ToJSON target must not be nil")
-	}
-	data, err := r.responseBytes()
+// Errors reported by the ErrorCheck and non-2xx responses return
+// *ResponseError. Network, read, and decode errors are returned with their
+// original error chain intact.
+//
+//	user, err := client.Get(ctx, "/users/1").ToJSON[User]()
+func (r *Request) ToJSON[T any]() (T, error) {
+	value, _, err := r.ToJSONResponse[T]()
+	return value, err
+}
+
+// ToJSONResponse is like ToJSON but also returns the buffered response, so
+// headers such as pagination or rate-limit information remain available.
+//
+// The *Response is non-nil whenever a response was received, including when
+// the status is not 2xx, the ErrorCheck reports an error, or decoding fails.
+// It is nil for build, network, and body read errors. Response.Body holds the
+// raw body; for a non-2xx response it is bounded to 64 KiB.
+//
+//	users, resp, err := client.Get(ctx, "/users").ToJSONResponse[[]User]()
+//	total := resp.Header.Get("X-Total-Count")
+func (r *Request) ToJSONResponse[T any]() (T, *Response, error) {
+	var value T
+	resp, err := r.response()
 	if err != nil {
-		return err
+		return value, resp, err
 	}
-	if len(data) == 0 {
-		return nil
+	if len(resp.Body) == 0 {
+		return value, resp, nil
 	}
-	return decodeJSONResponse(data, v, r.jsonUseNumber, r.jsonStrict)
+	if err := decodeJSONResponse(resp.Body, &value, r.jsonUseNumber, r.jsonStrict); err != nil {
+		return value, resp, err
+	}
+	return value, resp, nil
 }
 
-// ToBytes sends the request, requires a 2xx status, reads the response body,
-// and closes it.
+// ToBytes sends the request, requires a successful response, reads the
+// response body, and closes it.
 //
 // The body is limited by DefaultMaxResponseBytes or the value supplied to
 // WithMaxResponseBytes. ErrResponseTooLarge is returned when the limit is
-// exceeded. For large downloads, use Do and stream the body with io.Copy.
+// exceeded. For large downloads, use ToWriter or Do.
 func (r *Request) ToBytes() ([]byte, error) {
 	return r.responseBytes()
 }
@@ -90,24 +173,68 @@ func (r *Request) ToString() (string, error) {
 	return string(data), nil
 }
 
-func (r *Request) responseBytes() ([]byte, error) {
-	body, statusErr, err := r.readResponse()
-	if statusErr != nil {
-		return nil, r.statusError(statusErr, err)
+// ToLocation sends the request without following redirects and returns the
+// resolved target of the redirect response. A relative Location header is
+// resolved against the request URL. The body is discarded and closed.
+//
+// A 3xx response without a Location header returns an error matching
+// http.ErrNoLocation. Any other status returns a *ResponseError; the
+// ErrorCheck runs for non-2xx responses.
+//
+//	loc, err := client.Get(ctx, "/short/abc").ToLocation()
+//	fmt.Println(loc.String())
+func (r *Request) ToLocation() (*url.URL, error) {
+	if r == nil {
+		return nil, errors.New("req: nil request")
 	}
-	return body, err
-}
-
-// readResponse sends the request and reads the body with the configured limit.
-// A non-2xx response returns a StatusError and the error encountered while
-// reading its capture body, if any. A successful response returns its body.
-func (r *Request) readResponse() ([]byte, *StatusError, error) {
-	resp, err := r.Do()
+	resp, err := r.NoRedirect().Do()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if resp == nil {
-		return nil, nil, errors.New("req: HTTP client returned a nil response")
+		return nil, errors.New("req: HTTP client returned a nil response")
+	}
+	defer func() {
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		loc, err := resp.Location()
+		if err != nil {
+			return nil, fmt.Errorf("req: redirect location: %w", err)
+		}
+		return loc, nil
+	}
+	if !isSuccess(resp.StatusCode) {
+		_, err := r.errorFromResponse(resp)
+		return nil, err
+	}
+	body, truncated, _ := readLimited(resp.Body, maxErrorBodyBytes)
+	return nil, &ResponseError{Response: *newResponse(resp, body, truncated)}
+}
+
+func (r *Request) responseBytes() ([]byte, error) {
+	resp, err := r.response()
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// response sends the request, reads the body with the configured limit, and
+// applies the ErrorCheck and status handling. The returned *Response is
+// non-nil whenever a complete response was received, even with an error.
+func (r *Request) response() (*Response, error) {
+	if r == nil {
+		return nil, errors.New("req: nil request")
+	}
+	resp, err := r.Do()
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, errors.New("req: HTTP client returned a nil response")
 	}
 	defer func() {
 		if resp.Body != nil {
@@ -115,20 +242,69 @@ func (r *Request) readResponse() ([]byte, *StatusError, error) {
 		}
 	}()
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		statusErr, readErr := readStatusError(resp)
-		return nil, statusErr, readErr
+	if !isSuccess(resp.StatusCode) {
+		return r.errorFromResponse(resp)
 	}
 
 	limit := r.responseLimit()
 	body, truncated, err := readLimited(resp.Body, limit)
 	if err != nil {
-		return nil, nil, fmt.Errorf("req: read response body: %w", err)
+		return nil, fmt.Errorf("req: read response body: %w", err)
 	}
 	if truncated {
-		return nil, nil, fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, limit)
+		return nil, fmt.Errorf("%w: limit is %d bytes", ErrResponseTooLarge, limit)
 	}
-	return body, nil, nil
+	info := newResponse(resp, body, false)
+	if err := r.checkResponse(info); err != nil {
+		return info, err
+	}
+	return info, nil
+}
+
+// errorFromResponse reads the bounded body of a non-2xx response and returns
+// it with a *ResponseError. A read failure is joined so the HTTP status stays
+// visible to errors.As; the ErrorCheck is skipped because the body is
+// incomplete, and no *Response is returned.
+func (r *Request) errorFromResponse(resp *http.Response) (*Response, error) {
+	body, truncated, readErr := readLimited(resp.Body, maxErrorBodyBytes)
+	info := newResponse(resp, body, truncated)
+	if readErr != nil {
+		return nil, errors.Join(&ResponseError{Response: *info},
+			fmt.Errorf("req: read error response body: %w", readErr))
+	}
+	if err := r.checkResponse(info); err != nil {
+		return info, err
+	}
+	return info, &ResponseError{Response: *info}
+}
+
+// checkResponse runs the effective ErrorCheck and wraps a reported error.
+func (r *Request) checkResponse(info *Response) error {
+	check := r.errorCheck
+	if !r.errorCheckSet && r.client != nil {
+		check = r.client.errorCheck
+	}
+	if check == nil {
+		return nil
+	}
+	if err := check(info); err != nil {
+		return &ResponseError{Response: *info, Err: err}
+	}
+	return nil
+}
+
+func newResponse(resp *http.Response, body []byte, truncated bool) *Response {
+	return &Response{
+		StatusCode:    resp.StatusCode,
+		Status:        resp.Status,
+		Header:        resp.Header.Clone(),
+		Body:          body,
+		BodyTruncated: truncated,
+	}
+}
+
+func isSuccess(code int) bool {
+	return code >= 200 && code <= 299
 }
 
 func (r *Request) responseLimit() int64 {
@@ -140,24 +316,6 @@ func (r *Request) responseLimit() int64 {
 		limit = r.maxResponseBytes
 	}
 	return limit
-}
-
-// statusError combines a StatusError, an ErrorJSON decode failure, and an
-// error-body read failure without hiding the HTTP status from errors.As.
-func (r *Request) statusError(statusErr *StatusError, readErr error) error {
-	errs := []error{statusErr}
-	if readErr != nil {
-		errs = append(errs, readErr)
-	}
-	if r.errorJSONTarget != nil && len(statusErr.Body) > 0 {
-		if err := decodeErrorJSON(statusErr.Body, r.errorJSONTarget, r.jsonUseNumber); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	if len(errs) == 1 {
-		return statusErr
-	}
-	return errors.Join(errs...)
 }
 
 func decodeJSONResponse(data []byte, v any, useNumber, strict bool) error {
@@ -183,27 +341,6 @@ func decodeJSONResponse(data []byte, v any, useNumber, strict bool) error {
 	}
 	if err := decoder.Decode(v); err != nil {
 		return fmt.Errorf("req: decode JSON response: %w", err)
-	}
-	return nil
-}
-
-func decodeErrorJSON(data []byte, v any, useNumber bool) error {
-	if !useNumber {
-		if err := json.Unmarshal(data, v); err != nil {
-			return fmt.Errorf("%w: %w", ErrErrorBodyDecode, err)
-		}
-		return nil
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	// Match Unmarshal semantics: reject trailing data after the document.
-	if !json.Valid(data) {
-		var discard any
-		err := json.Unmarshal(data, &discard)
-		return fmt.Errorf("%w: %w", ErrErrorBodyDecode, err)
-	}
-	if err := decoder.Decode(v); err != nil {
-		return fmt.Errorf("%w: %w", ErrErrorBodyDecode, err)
 	}
 	return nil
 }

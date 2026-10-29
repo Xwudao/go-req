@@ -82,3 +82,55 @@ func decodeURLPath(escaped string) (decoded, raw string, err error) {
 	}
 	return decoded, raw, nil
 }
+
+// expandPathParams replaces {name} placeholders in the path portion of raw
+// with the escaped values from params. Every param must match a placeholder,
+// and every placeholder must have a param.
+func expandPathParams(raw string, params map[string]string) (string, error) {
+	end := strings.IndexAny(raw, "?#")
+	if end < 0 {
+		end = len(raw)
+	}
+	rawPath, rest := raw[:end], raw[end:]
+
+	var b strings.Builder
+	used := make(map[string]bool, len(params))
+	for {
+		open := strings.IndexByte(rawPath, '{')
+		if open < 0 {
+			b.WriteString(rawPath)
+			break
+		}
+		closing := strings.IndexByte(rawPath[open:], '}')
+		if closing < 0 {
+			return "", fmt.Errorf("req: unterminated path parameter in URL %q", raw)
+		}
+		name := rawPath[open+1 : open+closing]
+		value, ok := params[name]
+		if !ok {
+			return "", fmt.Errorf("req: missing path parameter %q in URL %q", name, raw)
+		}
+		b.WriteString(rawPath[:open])
+		b.WriteString(url.PathEscape(value))
+		used[name] = true
+		rawPath = rawPath[open+closing+1:]
+	}
+	for name := range params {
+		if !used[name] {
+			return "", fmt.Errorf("req: path parameter %q not found in URL %q", name, raw)
+		}
+	}
+	return b.String() + rest, nil
+}
+
+func validatePathParam(name, value string) error {
+	switch {
+	case name == "" || strings.ContainsAny(name, "{}/"):
+		return fmt.Errorf("req: invalid path parameter name %q", name)
+	case value == "":
+		return fmt.Errorf("req: path parameter %q must not be empty", name)
+	case value == "." || value == "..":
+		return fmt.Errorf("req: path parameter %q must not be a dot segment", name)
+	}
+	return nil
+}

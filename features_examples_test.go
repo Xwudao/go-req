@@ -68,8 +68,7 @@ func ExampleRequest_ToWriter() {
 func ExampleRequest_UseNumber() {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, `{"id":9007199254740993}`) }))
 	defer server.Close()
-	var data map[string]any
-	err := req.New().Get(context.Background(), server.URL).MaxResponseBytes(1024).UseNumber(true).ToJSON(&data)
+	data, err := req.New().Get(context.Background(), server.URL).MaxResponseBytes(1024).UseNumber(true).ToJSON[map[string]any]()
 	if err != nil {
 		fmt.Println(err)
 		return

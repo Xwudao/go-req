@@ -160,3 +160,84 @@ func WithMaxResponseBytes(n int64) Option {
 		return nil
 	}
 }
+
+// WithErrorCheck sets the ErrorCheck applied to responses read by requests
+// created by the Client. Use it for APIs that report errors in the response
+// body, including with a 2xx status; JSONError builds a check for a JSON error
+// type. Request.ErrorCheck overrides it for a single request.
+//
+// check must not be nil.
+func WithErrorCheck(check ErrorCheck) Option {
+	return func(c *Client) error {
+		if check == nil {
+			return configError("error check must not be nil")
+		}
+		c.errorCheck = check
+		return nil
+	}
+}
+
+// WithQuery sets a default query parameter for requests created by the Client.
+//
+// A default is added only when the request URL does not already contain key;
+// Query, AddQuery, and QueryValues on the builder are applied afterwards and
+// can override or extend it. WithQuery may be repeated; the last value for
+// the same key wins.
+func WithQuery(key, value string) Option {
+	return func(c *Client) error {
+		if c.query == nil {
+			c.query = make(url.Values)
+		}
+		c.query.Set(key, value)
+		return nil
+	}
+}
+
+// WithBeforeRequest adds a hook that runs on every *http.Request built by the
+// Client's request builders, after the URL, query, headers, and body are set.
+//
+// Hooks run in the order they were added, followed by hooks added with
+// Request.BeforeRequest. They may modify the request, for example to add a
+// signature or a fresh access token. Returning an error aborts the request.
+// To read a JSON or Form body without consuming it, use req.GetBody. Hooks
+// are not applied to requests passed directly to Client.Do.
+func WithBeforeRequest(hook func(*http.Request) error) Option {
+	return func(c *Client) error {
+		if hook == nil {
+			return configError("before-request hook must not be nil")
+		}
+		c.beforeRequest = append(c.beforeRequest, hook)
+		return nil
+	}
+}
+
+// WithoutRedirect makes the Client return redirect responses instead of
+// following them. Use Request.NoRedirect to do this for a single request.
+//
+// It cannot be combined with WithHTTPClient; set http.Client.CheckRedirect on
+// the supplied client instead.
+func WithoutRedirect() Option {
+	return func(c *Client) error {
+		c.checkRedirect = stopRedirect
+		c.redirectOption = "WithoutRedirect"
+		return nil
+	}
+}
+
+// WithCheckRedirect sets the redirect policy of the http.Client created by
+// req, with the same contract as http.Client.CheckRedirect. For example, it
+// can limit the number of redirects or refuse to leave a host. Returning
+// http.ErrUseLastResponse stops at the current redirect response.
+//
+// It cannot be combined with WithHTTPClient. The last of WithCheckRedirect and
+// WithoutRedirect wins.
+func WithCheckRedirect(fn func(req *http.Request, via []*http.Request) error) Option {
+	return func(c *Client) error {
+		if fn == nil {
+			return configError("redirect policy must not be nil")
+		}
+		c.checkRedirect = fn
+		c.redirectOption = "WithCheckRedirect"
+		return nil
+	}
+}

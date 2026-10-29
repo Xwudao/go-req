@@ -29,11 +29,12 @@ func TestGetToJSON(t *testing.T) {
 
 	client := req.New(req.WithBaseURL(srv.URL), req.WithHeader("User-Agent", "go-req"))
 
-	var user struct {
+	type User struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
 	}
-	if err := client.Get(context.Background(), "/users/1").ToJSON(&user); err != nil {
+	user, err := client.Get(context.Background(), "/users/1").ToJSON[User]()
+	if err != nil {
 		t.Fatalf("ToJSON: %v", err)
 	}
 	if gotPath != "/users/1" {
@@ -113,12 +114,11 @@ func TestPostJSON(t *testing.T) {
 	defer srv.Close()
 
 	client := req.New(req.WithBaseURL(srv.URL))
-	var result struct {
-		ID int `json:"id"`
-	}
-	err := client.Post(context.Background(), "/users").
+	result, err := client.Post(context.Background(), "/users").
 		JSON(map[string]any{"name": "Alice", "age": 25}).
-		ToJSON(&result)
+		ToJSON[struct {
+		ID int `json:"id"`
+	}]()
 	if err != nil {
 		t.Fatalf("ToJSON: %v", err)
 	}
@@ -561,9 +561,9 @@ func TestConnectionFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected connection error")
 	}
-	var statusErr *req.StatusError
-	if errors.As(err, &statusErr) {
-		t.Fatalf("connection error reported as StatusError: %v", err)
+	var respErr *req.ResponseError
+	if errors.As(err, &respErr) {
+		t.Fatalf("connection error reported as ResponseError: %v", err)
 	}
 	var urlErr *url.Error
 	if !errors.As(err, &urlErr) {
@@ -593,13 +593,12 @@ func TestSharedClientConcurrent(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			id := fmt.Sprintf("%d", i)
-			var response struct {
-				ID string `json:"id"`
-			}
-			err := client.Get(context.Background(), "/work").
+			response, err := client.Get(context.Background(), "/work").
 				Query("id", id).
 				Header("X-ID", id).
-				ToJSON(&response)
+				ToJSON[struct {
+				ID string `json:"id"`
+			}]()
 			if err != nil {
 				errs <- err
 				return

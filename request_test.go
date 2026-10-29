@@ -26,13 +26,12 @@ func TestQuerySemantics(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("set append and URL query", func(t *testing.T) {
-		var got url.Values
-		err := client.Get(ctx, "/users?page=0&keep=x&remove=1").
+		got, err := client.Get(ctx, "/users?page=0&keep=x&remove=1").
 			Query("page", "1").
 			AddQuery("tag", "go").
 			AddQuery("tag", "http").
 			QueryValues(url.Values{"limit": {"20"}, "remove": nil}).
-			ToJSON(&got)
+			ToJSON[url.Values]()
 		if err != nil {
 			t.Fatalf("ToJSON: %v", err)
 		}
@@ -54,11 +53,10 @@ func TestQuerySemantics(t *testing.T) {
 	})
 
 	t.Run("call order", func(t *testing.T) {
-		var got url.Values
-		err := client.Get(ctx, "/order").
+		got, err := client.Get(ctx, "/order").
 			AddQuery("x", "2").
 			Query("x", "1").
-			ToJSON(&got)
+			ToJSON[url.Values]()
 		if err != nil {
 			t.Fatalf("ToJSON: %v", err)
 		}
@@ -66,10 +64,10 @@ func TestQuerySemantics(t *testing.T) {
 			t.Errorf("x = %#v", values)
 		}
 
-		err = client.Get(ctx, "/order").
+		got, err = client.Get(ctx, "/order").
 			Query("x", "1").
 			AddQuery("x", "2").
-			ToJSON(&got)
+			ToJSON[url.Values]()
 		if err != nil {
 			t.Fatalf("ToJSON: %v", err)
 		}
@@ -79,11 +77,10 @@ func TestQuerySemantics(t *testing.T) {
 	})
 
 	t.Run("encoding", func(t *testing.T) {
-		var got url.Values
-		err := client.Get(ctx, "/encode").
+		got, err := client.Get(ctx, "/encode").
 			Query("q", "a b&c=d").
 			Query("unicode", "你好").
-			ToJSON(&got)
+			ToJSON[url.Values]()
 		if err != nil {
 			t.Fatalf("ToJSON: %v", err)
 		}

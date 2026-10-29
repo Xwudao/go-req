@@ -158,7 +158,7 @@ func (c *Client) doDebug(req *http.Request) (*http.Response, error) {
 		logRequest(debugBodySnapshot{})
 	}
 
-	resp, err := c.httpClient.Do(sendReq)
+	resp, err := c.clientFor(sendReq).Do(sendReq)
 	headerDuration := time.Since(start)
 	if requestCapture != nil {
 		// Custom RoundTrippers are not required to read or close the body.

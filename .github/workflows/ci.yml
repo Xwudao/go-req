@@ -8,7 +8,7 @@ jobs:
   test:
     strategy:
       matrix:
-        go: ['1.21.x', 'stable']
+        go: ['1.27.x', 'stable']
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

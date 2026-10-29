@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"time"
 )
 
 // Request is a mutable request builder created by a Client.
@@ -30,8 +31,9 @@ type Request struct {
 	method string
 	rawURL string
 
-	header   http.Header
-	queryOps []queryOperation
+	header     http.Header
+	queryOps   []queryOperation
+	pathParams map[string]string
 
 	body        io.Reader
 	bodyFactory func() io.Reader
@@ -39,10 +41,17 @@ type Request struct {
 	maxResponseBytes int64
 	jsonUseNumber    bool
 	jsonStrict       bool
-	errorJSONTarget  any
+
+	errorCheck    ErrorCheck
+	errorCheckSet bool
+
+	beforeRequest []func(*http.Request) error
+	timeout       time.Duration
 
 	debugSet bool
 	debug    bool
+
+	noRedirect bool
 
 	err error
 }
@@ -131,6 +140,85 @@ func (r *Request) QueryValues(values url.Values) *Request {
 	return r
 }
 
+// PathParam sets the value of a {name} placeholder in the request URL path.
+//
+// The value is escaped with url.PathEscape, so a slash in value never adds a
+// path segment. It must not be empty, ".", or "..". When any path parameter is
+// set, every placeholder in the URL path must be filled and every parameter
+// must match a placeholder; otherwise Build returns an error.
+//
+//	client.Get(ctx, "/users/{id}/posts/{pid}").PathParam("id", "42").PathParam("pid", "7")
+func (r *Request) PathParam(name, value string) *Request {
+	if r.err != nil {
+		return r
+	}
+	if err := validatePathParam(name, value); err != nil {
+		r.setErr(err)
+		return r
+	}
+	if r.pathParams == nil {
+		r.pathParams = make(map[string]string)
+	}
+	r.pathParams[name] = value
+	return r
+}
+
+// PathParams sets several path parameters at once. It follows the rules of
+// PathParam and replaces values already set for the same names.
+func (r *Request) PathParams(params map[string]string) *Request {
+	for name, value := range params {
+		r.PathParam(name, value)
+	}
+	return r
+}
+
+// BeforeRequest adds a hook that runs on the built *http.Request after the
+// Client's hooks. See WithBeforeRequest.
+func (r *Request) BeforeRequest(hook func(*http.Request) error) *Request {
+	if r.err != nil {
+		return r
+	}
+	if hook == nil {
+		r.setErr(errors.New("req: nil before-request hook"))
+		return r
+	}
+	r.beforeRequest = append(r.beforeRequest, hook)
+	return r
+}
+
+// NoRedirect makes this request stop at the first redirect response instead
+// of following it. The 3xx response is returned as is; use ToLocation to read
+// its target, or Do to inspect it directly.
+//
+// Like Debug, the choice is carried by the request context, so it also applies
+// if Build is followed by Client.Do. It works with WithHTTPClient as well,
+// because a shallow copy of the http.Client is used for this request only.
+func (r *Request) NoRedirect() *Request {
+	if r.err != nil {
+		return r
+	}
+	r.noRedirect = true
+	return r
+}
+
+// Timeout limits the whole request, including reading the response body, to d.
+//
+// It is applied when the request is sent through Do or a response helper, by
+// deriving a context from the request context. Build does not apply it. The
+// Client's WithTimeout still applies; the shorter limit wins. d must be
+// positive.
+func (r *Request) Timeout(d time.Duration) *Request {
+	if r.err != nil {
+		return r
+	}
+	if d <= 0 {
+		r.setErr(errors.New("req: request timeout must be positive"))
+		return r
+	}
+	r.timeout = d
+	return r
+}
+
 // JSON encodes v as JSON and sets the request body.
 //
 // Content-Type is set to application/json unless it was already set explicitly
@@ -209,30 +297,17 @@ func (r *Request) DisallowUnknownFields(enabled bool) *Request {
 	return r
 }
 
-// ErrorJSON sets a target that receives the decoded JSON body of a non-2xx
-// response.
+// ErrorCheck overrides the Client's ErrorCheck for this request. A nil check
+// disables error checking, so only the HTTP status decides success.
 //
-// It lets an API use one JSON shape for successful responses and another for
-// errors. The target is only touched by ToJSON, ToBytes, ToString, and
-// ToWriter when the response status is outside 2xx; successful responses leave
-// it unchanged. An empty error body also leaves it unchanged.
-//
-// The raw error body remains available in *StatusError, bounded to 64 KiB. If
-// decoding fails, the returned error still exposes *StatusError and also
-// matches ErrErrorBodyDecode. Decoding ignores DisallowUnknownFields; UseNumber
-// is honored for interface or json.Number targets.
-//
-// Do never reads or decodes the response body, so ErrorJSON does not apply to
-// the raw Do path.
-func (r *Request) ErrorJSON(v any) *Request {
+// It applies to ToJSON, ToBytes, ToString, and the non-2xx path of ToWriter.
+// Do never reads the response body, so no check is applied to it.
+func (r *Request) ErrorCheck(check ErrorCheck) *Request {
 	if r.err != nil {
 		return r
 	}
-	if v == nil {
-		r.setErr(errors.New("req: ErrorJSON target must not be nil"))
-		return r
-	}
-	r.errorJSONTarget = v
+	r.errorCheck = check
+	r.errorCheckSet = true
 	return r
 }
 
@@ -314,15 +389,28 @@ func (r *Request) Build() (*http.Request, error) {
 		return nil, errors.New("req: nil context")
 	}
 
-	target, err := resolveURL(r.client.baseURL, r.rawURL)
+	rawURL := r.rawURL
+	if len(r.pathParams) > 0 {
+		expanded, err := expandPathParams(rawURL, r.pathParams)
+		if err != nil {
+			return nil, err
+		}
+		rawURL = expanded
+	}
+	target, err := resolveURL(r.client.baseURL, rawURL)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(r.queryOps) > 0 {
+	if len(r.queryOps) > 0 || len(r.client.query) > 0 {
 		query, err := url.ParseQuery(target.RawQuery)
 		if err != nil {
 			return nil, fmt.Errorf("req: parse query in URL %q: %w", r.rawURL, err)
+		}
+		for key, values := range r.client.query {
+			if _, exists := query[key]; !exists {
+				query[key] = append([]string(nil), values...)
+			}
 		}
 		for _, op := range r.queryOps {
 			switch {
@@ -363,12 +451,25 @@ func (r *Request) Build() (*http.Request, error) {
 	if r.debugSet {
 		ctx = context.WithValue(ctx, debugContextKey{}, r.debug)
 	}
+	if r.noRedirect {
+		ctx = context.WithValue(ctx, noRedirectContextKey{}, true)
+	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, r.method, target.String(), body)
 	if err != nil {
 		return nil, fmt.Errorf("req: build HTTP request: %w", err)
 	}
 	httpReq.Header = header
+	for _, hook := range r.client.beforeRequest {
+		if err := hook(httpReq); err != nil {
+			return nil, fmt.Errorf("req: before-request hook: %w", err)
+		}
+	}
+	for _, hook := range r.beforeRequest {
+		if err := hook(httpReq); err != nil {
+			return nil, fmt.Errorf("req: before-request hook: %w", err)
+		}
+	}
 	return httpReq, nil
 }
 
@@ -384,5 +485,27 @@ func (r *Request) Do() (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	return r.client.Do(req)
+	if r.timeout <= 0 {
+		return r.client.Do(req)
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), r.timeout)
+	resp, err := r.client.Do(req.WithContext(ctx))
+	if err != nil || resp == nil || resp.Body == nil {
+		cancel()
+		return resp, err
+	}
+	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+// cancelOnClose releases a per-request timeout when the body is closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }

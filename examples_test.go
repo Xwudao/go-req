@@ -21,11 +21,12 @@ func ExampleClient_Get() {
 
 	client := req.New(req.WithBaseURL(srv.URL))
 
-	var user struct {
+	type User struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
 	}
-	if err := client.Get(context.Background(), "/users/1").ToJSON(&user); err != nil {
+	user, err := client.Get(context.Background(), "/users/1").ToJSON[User]()
+	if err != nil {
 		fmt.Println("error:", err)
 		return
 	}
@@ -43,12 +44,12 @@ func ExampleClient_Post() {
 
 	client := req.New(req.WithBaseURL(srv.URL))
 
-	var created struct {
+	type Created struct {
 		ID int `json:"id"`
 	}
-	err := client.Post(context.Background(), "/users").
+	created, err := client.Post(context.Background(), "/users").
 		JSON(map[string]any{"name": "Alice", "age": 25}).
-		ToJSON(&created)
+		ToJSON[Created]()
 	if err != nil {
 		fmt.Println("error:", err)
 		return

@@ -61,10 +61,10 @@ func TestWithTransport(t *testing.T) {
 		t.Fatalf("Timeout = %v", client.HTTPClient().Timeout)
 	}
 
-	var out struct {
+	out, err := client.Get(context.Background(), "/custom").ToJSON[struct {
 		Source string `json:"source"`
-	}
-	if err := client.Get(context.Background(), "/custom").ToJSON(&out); err != nil {
+	}]()
+	if err != nil {
 		t.Fatalf("ToJSON: %v", err)
 	}
 	if out.Source != "custom" {
@@ -216,9 +216,9 @@ func TestCustomRoundTripperResponseStatus(t *testing.T) {
 	transport := &recordingTransport{status: http.StatusTeapot, response: "short and stout"}
 	client := req.New(req.WithTransport(transport))
 	_, err := client.Get(context.Background(), "https://example.com").ToBytes()
-	var statusErr *req.StatusError
+	var statusErr *req.ResponseError
 	if !errors.As(err, &statusErr) {
-		t.Fatalf("err = %v, want StatusError", err)
+		t.Fatalf("err = %v, want ResponseError", err)
 	}
 	if statusErr.StatusCode != http.StatusTeapot {
 		t.Fatalf("status = %d", statusErr.StatusCode)

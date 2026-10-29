@@ -44,7 +44,7 @@ func TestToWriterClosesBody(t *testing.T) {
 				t.Fatal(err)
 			}
 			if status == 400 {
-				var se *StatusError
+				var se *ResponseError
 				if !errors.As(err, &se) {
 					t.Fatal(err)
 				}

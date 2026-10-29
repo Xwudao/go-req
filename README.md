@@ -15,7 +15,7 @@
 - 不修改 `http.DefaultClient` 或 `http.DefaultTransport`。
 - 可以用原生 `http.Request` 直接调用 `Client.Do`。
 
-要求 Go 1.21 或更高版本。
+要求 Go 1.27 或更高版本（JSON 解码使用 Go 1.27 引入的泛型方法）。
 
 ## 安装
 
@@ -34,8 +34,7 @@ package 名是 `req`，因此通常写作 `req.New(...)`。
 ```go
 client := req.New()
 
-var user User
-err := client.Get(ctx, "https://api.example.com/users/1").ToJSON(&user)
+user, err := client.Get(ctx, "https://api.example.com/users/1").ToJSON[User]()
 if err != nil {
     return err
 }
@@ -56,9 +55,7 @@ client := req.New(
 GET：
 
 ```go
-var user User
-
-err := client.Get(ctx, "/users/1").ToJSON(&user)
+user, err := client.Get(ctx, "/users/1").ToJSON[User]()
 if err != nil {
     return err
 }
@@ -67,14 +64,12 @@ if err != nil {
 POST JSON 不需要手动 `json.Marshal`：
 
 ```go
-var result CreateUserResponse
-
-err := client.Post(ctx, "/users").
+result, err := client.Post(ctx, "/users").
     JSON(map[string]any{
         "name": "Alice",
         "age":  25,
     }).
-    ToJSON(&result)
+    ToJSON[CreateUserResponse]()
 if err != nil {
     return err
 }
@@ -95,12 +90,10 @@ client.NewRequest(ctx, http.MethodOptions, "/users")
 ## Query 参数
 
 ```go
-var users []User
-
-err := client.Get(ctx, "/users").
+users, err := client.Get(ctx, "/users").
     Query("page", "1").
     Query("limit", "20").
-    ToJSON(&users)
+    ToJSON[[]User]()
 ```
 
 语义是明确区分的：
@@ -128,13 +121,43 @@ AddQuery("x", "2").Query("x", "1") // x=1
 Query("x", "1").AddQuery("x", "2") // x=1&x=2
 ```
 
+Client 级默认 Query（如 `appid`、`access_token`）：
+
+```go
+client := req.New(
+    req.WithBaseURL("https://api.example.com"),
+    req.WithQuery("appid", "wx123"),
+)
+
+client.Get(ctx, "/users")               // ?appid=wx123
+client.Get(ctx, "/users?appid=other")   // URL 中已有同名参数时不添加默认值
+client.Get(ctx, "/users").Query("appid", "x") // Builder 上的操作在默认值之后生效
+```
+
+## 路径参数
+
+```go
+client.Get(ctx, "/users/{id}/posts/{pid}").
+    PathParam("id", "42").
+    PathParam("pid", "7")
+
+// 也可以一次传入 map
+client.Get(ctx, "/users/{id}/posts/{pid}").
+    PathParams(map[string]string{"id": "42", "pid": "7"})
+```
+
+- 值使用 `url.PathEscape` 转义，`"a/b c"` 会变成 `a%2Fb%20c`，不会多出路径段。
+- 值不能为空，也不能是 `.` 或 `..`，避免意外请求到别的接口。
+- 只要设置了路径参数，URL 路径中的每个 `{name}` 都必须有值，每个参数也必须
+  对应一个占位符，否则 `Build` 返回错误。只替换路径部分，query 和 fragment 不受影响。
+
 ## Header、Cookie 与认证
 
 ```go
-err := client.Get(ctx, "/users").
+result, err := client.Get(ctx, "/users").
     Header("Authorization", "Bearer token").
     Header("X-Request-ID", "123").
-    ToJSON(&result)
+    ToJSON[Result]()
 ```
 
 批量复制 Header：
@@ -168,15 +191,57 @@ hc := &http.Client{Jar: jar}
 client := req.New(req.WithHTTPClient(hc))
 ```
 
+### 请求钩子：签名与动态 Token
+
+`WithBeforeRequest` 在请求构建完成（URL、Query、Header、Body 都已设置）后、
+发送前执行，可以修改请求，适合签名或注入会过期的 token：
+
+```go
+client := req.New(
+    req.WithBaseURL("https://api.example.com"),
+    req.WithBeforeRequest(func(r *http.Request) error {
+        ts := strconv.FormatInt(time.Now().Unix(), 10)
+        var body []byte
+        if r.GetBody != nil { // JSON/Form Body 可通过 GetBody 读取副本，不影响发送
+            rc, err := r.GetBody()
+            if err != nil {
+                return err
+            }
+            body, _ = io.ReadAll(rc)
+        }
+        r.Header.Set("X-Timestamp", ts)
+        r.Header.Set("X-Sign", sign(r.Method, r.URL.RequestURI(), ts, body))
+        return nil
+    }),
+    req.WithBeforeRequest(func(r *http.Request) error {
+        token, err := tokens.Get(r.Context()) // 自己的 token 缓存/刷新逻辑
+        if err != nil {
+            return err
+        }
+        r.Header.Set("Authorization", "Bearer "+token)
+        return nil
+    }),
+)
+
+// 单个请求追加钩子，在 Client 的钩子之后执行。
+client.Get(ctx, "/x").BeforeRequest(func(r *http.Request) error { ... })
+```
+
+- 多个钩子按添加顺序执行：先 Client 的，再 Request 的。
+- 钩子返回错误时请求不会发送。
+- 钩子在 `Build` 中执行，所以 `Build` 后再 `client.Do` 也已经签过名；直接传给
+  `Client.Do` 的原生请求不会执行钩子。
+- `Body(reader)` 设置的 Body 没有 `GetBody`，不要在钩子里读取 `r.Body`。
+
 ## Form 请求
 
 ```go
-err := client.Post(ctx, "/login").
+result, err := client.Post(ctx, "/login").
     Form(url.Values{
         "username": {"Alice"},
         "password": {"secret"},
     }).
-    ToJSON(&result)
+    ToJSON[LoginResult]()
 ```
 
 Form 使用 `url.Values.Encode()`，Content-Type 默认为 `application/x-www-form-urlencoded`。
@@ -190,7 +255,7 @@ if err != nil {
 }
 defer file.Close() // Reader 始终归调用方所有
 
-err = client.Post(ctx, "/upload").Multipart(
+result, err := client.Post(ctx, "/upload").Multipart(
     url.Values{"description": {"月报"}},
     req.MultipartFile{
         FieldName:   "files",
@@ -198,12 +263,57 @@ err = client.Post(ctx, "/upload").Multipart(
         ContentType: "application/pdf", // 可省略，默认 application/octet-stream
         Reader:      file,
     },
-).ToJSON(&result)
+).ToJSON[UploadResult]()
 ```
 
 可传多个 `MultipartFile`，允许相同 FieldName。字段和文件元数据在调用时复制；文件不缓冲到内存，Build 不读取文件，也不启动后台 goroutine。文件 Reader 只消费一次，不支持自动重放或重定向重发；重复 Build 不会倒回。调用方负责关闭文件，包括请求失败或取消时。Context 在每次读取前检查；阻塞中的自定义 Reader 需要调用方负责解除阻塞。
 
 Multipart 自动生成带 boundary 的 Content-Type。显式 Header 会覆盖它，通常不应手动设置。无论使用 Body、JSON、Form 还是 Multipart，切换 Body 类型时都应确保 Content-Type 与实际内容匹配。
+
+## 重定向
+
+默认和标准库一样自动跟随重定向（最多 10 次）。只想拿到跳转地址时用 `ToLocation`：
+
+```go
+loc, err := client.Get(ctx, "/short/abc").ToLocation()
+if err != nil {
+    return err
+}
+fmt.Println(loc.String()) // 相对 Location 已按请求 URL 解析成绝对地址
+```
+
+- 不会跟随跳转，只发送一次请求；Body 自动丢弃并关闭。
+- 3xx 但没有 `Location` Header 时，错误满足 `errors.Is(err, http.ErrNoLocation)`。
+- 非 3xx 返回 `*ResponseError`（非 2xx 会执行 ErrorCheck）。
+
+需要 3xx 响应的其他信息（Header、Set-Cookie 等）时，用 `NoRedirect`：
+
+```go
+resp, err := client.Get(ctx, "/login").NoRedirect().Do()
+// resp.StatusCode == 302，resp.Header.Get("Location")、resp.Cookies() 均可读取
+
+_, info, err := client.Post(ctx, "/login").Form(form).NoRedirect().ToJSONResponse[any]()
+// 3xx 按非 2xx 处理，err 为 *ResponseError，info.Header 仍可读取
+```
+
+Client 级别的策略：
+
+```go
+req.New(req.WithoutRedirect()) // 所有请求都不跟随
+
+req.New(req.WithCheckRedirect(func(r *http.Request, via []*http.Request) error {
+    if len(via) >= 3 {
+        return errors.New("too many redirects")
+    }
+    return nil
+})) // 与 http.Client.CheckRedirect 含义相同
+```
+
+- `NoRedirect` 只影响当前请求：使用底层 `http.Client` 的浅拷贝，不修改共享的
+  Client、Transport 和 CookieJar，因此与 `WithHTTPClient` 一起用也没问题。
+  与 Debug 一样，它随 `Build()` 生成的请求保留，`Build` 后再 `client.Do` 同样生效。
+- `WithoutRedirect` / `WithCheckRedirect` 不能与 `WithHTTPClient` 组合，请直接设置
+  外部 Client 的 `CheckRedirect`。两者同时使用时最后一个生效。
 
 ## 原生 http.Client
 
@@ -380,7 +490,7 @@ resp, err := client.Do(httpReq)
 ## 响应读取
 
 ```go
-err := client.Get(ctx, "/users/1").ToJSON(&user)
+user, err := client.Get(ctx, "/users/1").ToJSON[User]()
 
 data, err := client.Get(ctx, "/raw").ToBytes()
 
@@ -390,9 +500,38 @@ text, err := client.Get(ctx, "/text").ToString()
 三个 helper 的行为一致：
 
 1. 发送请求。
-2. 非 2xx 返回 `*StatusError`。
-3. 读取 Body。
-4. 关闭 Body。
+2. 读取 Body（非 2xx 最多读取 64 KiB）并关闭。
+3. 执行 ErrorCheck（如果配置了），由它判定是否为 API 错误。
+4. 非 2xx 或被判定为错误时返回 `*ResponseError`。
+
+`ToJSON[T]` 中 `T` 是任意可被 `encoding/json` 解码的类型：
+
+```go
+user, err := client.Get(ctx, "/users/1").ToJSON[User]()
+users, err := client.Get(ctx, "/users").ToJSON[[]User]()
+raw, err := client.Get(ctx, "/anything").ToJSON[map[string]any]()
+```
+
+空 Body（包括 `204 No Content`）返回 `T` 的零值且没有错误。需要区分
+“空响应”和“解码出的零值”时，用指针类型：
+
+```go
+user, err := client.Get(ctx, "/users/1").ToJSON[*User]()
+// 204 No Content 或 JSON null 时 user == nil，err == nil。
+```
+
+需要成功响应的 Header 或状态码（分页、限流信息等）时，使用 `ToJSONResponse`：
+
+```go
+users, resp, err := client.Get(ctx, "/users").ToJSONResponse[[]User]()
+if err != nil {
+    return err
+}
+total := resp.Header.Get("X-Total-Count")
+```
+
+只要收到了响应，`resp` 就不为 nil：非 2xx、ErrorCheck 判定的错误、JSON 解码失败
+时都能读取 Header（例如 429 的 `Retry-After`）。构建、网络和读取错误时为 nil。
 
 成功响应默认最多读取 64 MiB，可通过选项调整：
 
@@ -404,7 +543,7 @@ client := req.New(req.WithMaxResponseBytes(10 << 20))
 
 ```go
 if errors.Is(err, req.ErrResponseTooLarge) {
-    // 使用 Do 配合 io.Copy 流式下载，而不是 ToBytes。
+    // 使用 ToWriter 或 Do 流式下载，而不是 ToBytes。
 }
 ```
 
@@ -427,126 +566,158 @@ defer file.Close()
 n, err := client.Get(ctx, "/report.zip").ToWriter(file)
 ```
 
-`ToWriter` 检查 2xx 状态、流式写入、自动关闭响应 Body，但不关闭 Writer；失败时返回已写入的字节数。非 2xx 不写入 Writer，返回 StatusError。它没有隐式大小上限，处理不可信下载时请配置 Context deadline 或限量 Writer。发生错误时 Writer 可能已有部分数据；文件创建、覆盖、清理由调用方负责。
-
-空 Body（包括 `204 No Content`）传给 `ToJSON` 时返回 `nil`，不会修改目标值。JSON `null` 按 `encoding/json` 的标准语义处理。
+`ToWriter` 检查 2xx 状态、流式写入、自动关闭响应 Body，但不关闭 Writer；失败时返回已写入的字节数。非 2xx 不写入 Writer，返回 `*ResponseError`。2xx Body 是流式写入而非缓冲读取，因此 ErrorCheck 只对非 2xx 生效。它没有隐式大小上限，处理不可信下载时请配置 Context deadline 或限量 Writer。发生错误时 Writer 可能已有部分数据；文件创建、覆盖、清理由调用方负责。
 
 JSON 解码可按请求启用选项，默认行为不变：
 
 ```go
-var data map[string]any
-err := client.Get(ctx, "/numbers").UseNumber(true).ToJSON(&data)
+data, err := client.Get(ctx, "/numbers").UseNumber(true).ToJSON[map[string]any]()
 // data 中的数字使用 json.Number，避免 float64 精度损失。
 
-err = client.Get(ctx, "/user").DisallowUnknownFields(true).ToJSON(&user)
-// 返回结构体未定义的字段时解码失败；错误可能发生在部分字段已写入之后。
+user, err := client.Get(ctx, "/user").DisallowUnknownFields(true).ToJSON[User]()
+// 返回结构体未定义的字段时解码失败。
 ```
 
 两项可组合，仍只接受单个完整 JSON 文档，不接受尾随内容。
 
-### 错误响应 JSON
+### 流式响应：SSE 与 JSON Lines
 
-很多 API 的成功响应和错误响应使用不同的 JSON 结构。可以用
-`ErrorJSON` 为错误响应指定解码目标，同时用 `ToJSON` 解码成功响应：
+`ToSSE` 逐个返回 Server-Sent Events，`ToJSONStream[T]` 逐行解码 NDJSON / JSON
+Lines，都使用 Go 的 range-over-func 迭代器：
 
 ```go
-type APIError struct {
-    Code    int    `json:"code"`
-    Message string `json:"message"`
+for ev, err := range client.Post(ctx, "/chat").JSON(body).ToSSE() {
+    if err != nil {
+        return err
+    }
+    if ev.Data == "[DONE]" { // 结束标记由你判断，库不做假设
+        break
+    }
+    chunk, err := ev.JSON[Chunk]()
+    if err != nil {
+        return err
+    }
+    fmt.Print(chunk.Text)
 }
 
-var user User
-var apiErr APIError
-
-err := client.Get(ctx, "/users/1").
-    ErrorJSON(&apiErr).
-    ToJSON(&user)
-
-var statusErr *req.StatusError
-if errors.As(err, &statusErr) {
-    fmt.Println(statusErr.StatusCode, apiErr.Code, apiErr.Message)
+for entry, err := range client.Get(ctx, "/logs").ToJSONStream[LogEntry]() {
+    if err != nil {
+        return err
+    }
+    fmt.Println(entry.Message)
 }
 ```
+
+`SSEEvent` 包含 `ID`、`Event`、`Data`（多行 data 用 `\n` 连接）和 `Retry`。
 
 语义：
 
-- `ErrorJSON` 只影响非 2xx 响应；2xx 不会修改目标。
-- 空错误 Body 不会修改目标，也不返回解码错误。
-- 原始错误 Body 仍保存在 `StatusError.Body` 中，最多 64 KiB。
-- 错误 JSON 解码失败不会隐藏 HTTP 状态：错误链同时包含 `*StatusError`
-  和 `req.ErrErrorBodyDecode`，可用 `errors.As` / `errors.Is` 检查。
-- 错误 Body 解码忽略 `DisallowUnknownFields`；`UseNumber` 对
-  `map[string]any` 或 `json.Number` 目标仍然生效。
-- `ErrorJSON` 适用于 `ToJSON`、`ToBytes`、`ToString` 和 `ToWriter`。
-  原生 `Do` 不读取 Body，因此不会应用该设置。
+- 每次 `range` 都会发送一次请求；循环结束（读完、`break` 或出错）时自动关闭 Body。
+- 产生错误后迭代立即结束。
+- 非 2xx 只产生一次 `*ResponseError`（会执行 ErrorCheck）。
+- ErrorCheck 对**每个事件的 data / 每一行**执行。流中途推送的错误对象（如
+  `{"code":5,"msg":"busy"}`）会像普通响应一样被识别，`errors.As` 可直接取到。
+- `ToSSE` 收到 2xx 但 Content-Type 是 JSON 时（有些 API 出错时不建立流），会整体读取
+  并执行 ErrorCheck；未被判定为错误时返回 “expected an event stream” 错误。
+- 单行和单个事件的 data 受 `WithMaxResponseBytes` / `MaxResponseBytes` 限制，超过时
+  返回 `ErrResponseTooLarge`。整个流没有总大小限制，需要时配合 `Timeout` 或 Context。
+- SSE 解析遵循规范：支持 `\r\n`、`\n`、`\r` 换行，忽略注释行和开头的 BOM，
+  `id` 在后续事件中保留。流末尾缺少空行时，最后一个事件仍会返回。
+- `ToJSONStream` 跳过空行，解码遵循 `UseNumber` 和 `DisallowUnknownFields`。
 
-如果不想在发送前指定目标，也可以在拿到 `StatusError` 后解码：
+### API 错误：ErrorCheck
+
+很多 API 的成功响应和错误响应是完全不同的 JSON，而且错误不一定用 HTTP
+状态表示：
+
+```text
+HTTP 200 {"id":7,"name":"alice"}              成功
+HTTP 200 {"code":40001,"msg":"token expired"} 失败
+HTTP 401 {"code":40100,"msg":"unauthorized"}  失败
+```
+
+什么样的响应算错误，完全由你决定：在 Client 上配置一次 `ErrorCheck`，
+所有请求的调用处保持 `ToJSON[T]()` 不变。
 
 ```go
+type APIError struct {
+    Code int    `json:"code"`
+    Msg  string `json:"msg"`
+}
+
+func (e APIError) Error() string { return fmt.Sprintf("%d: %s", e.Code, e.Msg) }
+
+client := req.New(
+    req.WithBaseURL("https://api.example.com"),
+    req.WithErrorCheck(req.JSONError(func(resp *req.Response, e APIError) bool {
+        return e.Code != 0 // 判定规则由你决定，可以结合 resp.StatusCode / resp.Header
+    })),
+)
+
+user, err := client.Get(ctx, "/users/1").ToJSON[User]()
+
 var apiErr APIError
-if err := statusErr.DecodeJSON(&apiErr); err != nil {
-    // 错误 Body 为空时返回 nil 且不修改目标。
-}
-```
-
-## 泛型方法
-
-Go 1.27 起支持泛型方法，泛型能力直接挂在 Builder 上：
-
-```go
-user, err := client.Get(ctx, "/users/1").Decode[User]()
-```
-
-需要区分“空响应”和“解码出的零值”时使用 `DecodePtr`：
-
-```go
-user, err := client.Get(ctx, "/users/1").DecodePtr[User]()
-// 204 No Content 时 user == nil，err == nil。
-```
-
-成功和错误响应结构不同时，使用 `DecodeWithError`，把错误 Body 解码到
-泛型错误类型：
-
-```go
-user, err := client.Get(ctx, "/users/1").DecodeWithError[User, APIError]()
-
-var apiErr *req.TypedStatusError[APIError]
 if errors.As(err, &apiErr) {
-    fmt.Println(apiErr.StatusCode)   // 400
-    fmt.Println(apiErr.Data.Code)    // 40001
-    fmt.Println(apiErr.Data.Message) // bad request
-    fmt.Println(string(apiErr.Body)) // 原始错误 Body
+    // 不管是 HTTP 200 还是 4xx/5xx，只要判定为 API 错误，都在这里处理。
+    fmt.Println(apiErr.Code, apiErr.Msg)
 }
 ```
 
-`TypedStatusError[T]` 内嵌 `StatusError`，因此 `StatusCode`、`Status`、
-`Header`、`Body`、`BodyTruncated` 和 `DecodeJSON` 可直接使用；
-`errors.As(err, &statusErr)` 仍然可以得到 `*req.StatusError`。
-错误 Body 无法解码时 `Data` 保持零值，`DecodeErr` 非空且错误链匹配
-`ErrErrorBodyDecode`；读取失败时 `ReadErr` 非空。
+`JSONError[E]` 的规则：
 
-`DecodeWithError` 使用自己的类型参数 `E`，不会使用 Builder 上通过
-`ErrorJSON` 设置的目标。需要复用同一个错误目标时，使用非泛型写法
-`ErrorJSON(&apiErr).ToJSON(&result)`。
+- 对每个非空 Body，尝试解码为 `E`；解码失败（例如成功响应是数组、错误页是
+  HTML）或 Body 为 JSON `null` 时不算 API 错误，交给默认的状态码处理。
+- 解码成功后调用你的判定函数；返回 `true` 时 `E` 作为错误返回。
+- `E` 必须实现 `error`，通常用值类型。解码 `E` 时忽略 `DisallowUnknownFields`
+  和 `UseNumber`（成功 Body 通常含有 `E` 未声明的字段）。
+- 判定函数接收 `*req.Response`，可以按状态码、Header 等区分，例如
+  `return !resp.IsSuccess()` 只把非 2xx 当作 API 错误。
 
-泛型方法与普通方法遵循相同规则：非 2xx 返回状态错误（`DecodeWithError`
-返回 `TypedStatusError`，其余方法返回 `StatusError`），空 Body 不修改目标，
-成功 Body 受 `WithMaxResponseBytes` / `MaxResponseBytes` 限制，JSON 解码受
-`UseNumber` 和 `DisallowUnknownFields` 影响。
-
-### Go 1.21～1.26 兼容写法
-
-泛型方法是 Go 1.27 新增的语言特性。模块的最低版本仍是 Go 1.21，因此
-`Decode` 系列方法只在 Go 1.27 及以上可用。较低版本可以使用等价的
-package-level 函数：
+需要完全自定义（非 JSON、按 Header 判定、返回自己的错误类型等）时，直接写
+`ErrorCheck`：
 
 ```go
-user, err := req.ToJSON[User](client.Get(ctx, "/users/1"))
-user, err := req.ToJSONPtr[User](client.Get(ctx, "/users/1"))
-user, err := req.ToJSONWithError[User, APIError](client.Get(ctx, "/users/1"))
+type ErrorCheck func(resp *req.Response) error
+
+client := req.New(req.WithErrorCheck(func(resp *req.Response) error {
+    if resp.Header.Get("X-Error-Code") != "" {
+        return fmt.Errorf("upstream error %s", resp.Header.Get("X-Error-Code"))
+    }
+    return nil
+}))
 ```
 
-两者语义完全一致，只是调用形式和最低 Go 版本不同。
+返回非 nil 即判定为错误，2xx 也一样；返回 nil 则保持默认行为：2xx 成功，
+非 2xx 返回不带 `Err` 的 `*ResponseError`。ErrorCheck 不能把非 2xx 变成成功。
+
+单个请求可以覆盖或关闭 Client 的 ErrorCheck：
+
+```go
+// 这个接口属于另一个服务，错误格式不同。
+data, err := client.Get(ctx, "https://other.example.com/x").
+    ErrorCheck(otherCheck).
+    ToJSON[Data]()
+
+// 传 nil 关闭检查，只按 HTTP 状态判断。
+data, err := client.Get(ctx, "/raw").ErrorCheck(nil).ToJSON[Data]()
+```
+
+ErrorCheck 作用于 `ToJSON`、`ToBytes`、`ToString` 以及 `ToWriter` 的非 2xx
+响应。原生 `Do` 不读取 Body，因此不会执行检查。
+
+如果成功和失败共用一个外层结构（如 `{"code":0,"data":{...}}`），可以直接
+定义该结构，再配合 ErrorCheck 判定 code：
+
+```go
+type Envelope[T any] struct {
+    Code int    `json:"code"`
+    Msg  string `json:"msg"`
+    Data T      `json:"data"`
+}
+
+env, err := client.Get(ctx, "/users/1").ToJSON[Envelope[User]]()
+user := env.Data
+```
 
 ## Debug
 
@@ -558,8 +729,7 @@ client := req.New(
     req.WithBaseURL("https://api.example.com"),
 )
 
-var user User
-err := client.Get(ctx, "/users/1").ToJSON(&user)
+user, err := client.Get(ctx, "/users/1").ToJSON[User]()
 ```
 
 自定义输出目标、Body 捕获上限：
@@ -577,12 +747,12 @@ client := req.New(
 
 ```go
 // Client 未开启 Debug，仅该请求输出。
-err := client.Get(ctx, "/users").
+users, err := client.Get(ctx, "/users").
     Debug(true).
-    ToJSON(&users)
+    ToJSON[[]User]()
 
 // Client 已开启 Debug，仅该请求静默。
-err = client.Get(ctx, "/health").
+text, err := client.Get(ctx, "/health").
     Debug(false).
     ToString()
 ```
@@ -644,58 +814,54 @@ client := req.New(
 
 错误分类包括：请求构造、URL 解析、JSON 编码/解码、网络、Context、超时、HTTP 状态和配置冲突。错误链使用 `%w` 保留。
 
-HTTP 非 2xx：
+响应级错误（非 2xx，或 ErrorCheck 判定的 API 错误）统一返回 `*ResponseError`：
 
 ```go
-err := client.Get(ctx, "/missing").ToJSON(&result)
+user, err := client.Get(ctx, "/missing").ToJSON[User]()
 
-var statusErr *req.StatusError
-if errors.As(err, &statusErr) {
-    fmt.Println(statusErr.StatusCode) // 404
-    fmt.Println(statusErr.Status)     // 404 Not Found
-    fmt.Println(string(statusErr.Body))
+var respErr *req.ResponseError
+if errors.As(err, &respErr) {
+    fmt.Println(respErr.StatusCode) // 404
+    fmt.Println(respErr.Status)     // 404 Not Found
+    fmt.Println(string(respErr.Body))
 }
 ```
 
-`StatusError` 结构：
+结构：
 
 ```go
-type StatusError struct {
-    StatusCode int
-    Status     string
-    Header     http.Header
-    Body       []byte
-    BodyTruncated bool
+type Response struct {
+    StatusCode    int
+    Status        string
+    Header        http.Header
+    Body          []byte
+    BodyTruncated bool // 仅非 2xx：Body 是否超过 64 KiB 被截断
 }
 
-// DecodeJSON 将捕获的错误 Body 解码到 v。
-func (e *StatusError) DecodeJSON(v any) error
+type ResponseError struct {
+    Response
+    Err error // ErrorCheck 返回的错误；普通非 2xx 时为 nil
+}
 ```
 
-错误响应的 Body 最多保留 64 KiB，避免恶意服务端造成内存问题。超过时 BodyTruncated 为 true；恰好等于上限为 false。该截断不属于错误。如果读取本身失败，错误链同时保留 StatusError 和底层读取错误；BodyTruncated 为 false 不代表读取一定完成，应同时检查错误链。
+`ResponseError.Unwrap` 返回 `Err`，所以 `errors.As(err, &apiErr)` 能直接拿到
+ErrorCheck 返回的 API 错误类型，同时 `errors.As(err, &respErr)` 仍可取得状态码和
+原始 Body。
+
+非 2xx 的 Body 最多保留 64 KiB，避免恶意服务端造成内存问题。超过时 BodyTruncated 为 true；恰好等于上限为 false。该截断不属于错误。如果读取本身失败，错误链同时保留 `*ResponseError` 和底层读取错误，且不会执行 ErrorCheck；BodyTruncated 为 false 不代表读取一定完成，应同时检查错误链。
 
 其他常用判断：
 
 ```go
 errors.Is(err, req.ErrResponseTooLarge)
-errors.Is(err, req.ErrErrorBodyDecode)
 errors.Is(err, req.ErrNoBaseURL)
 errors.Is(err, req.ErrConfiguration)
 errors.Is(err, context.Canceled)
 errors.Is(err, context.DeadlineExceeded)
 ```
 
-`WithTimeout` 底层是 `http.Client.Timeout`。Go 1.23 起，超时错误同时满足
-`errors.Is(err, context.DeadlineExceeded)`；Go 1.21 与 1.22 的超时错误只提供
-`net.Error.Timeout()`。需要兼容多个 Go 版本时可同时检查：
-
-```go
-var netErr net.Error
-if errors.Is(err, context.DeadlineExceeded) ||
-    (errors.As(err, &netErr) && netErr.Timeout()) {
-    // timeout
-}
-```
+`WithTimeout` 底层是 `http.Client.Timeout`，超时错误满足
+`errors.Is(err, context.DeadlineExceeded)`。
 
 HTTP 404/500 不会被伪装成网络错误；连接失败则会保留底层 `*url.Error` 链。
 
@@ -707,15 +873,27 @@ HTTP 404/500 不会被伪装成网络错误；连接失败则会保留底层 `*u
 ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 defer cancel()
 
-err := client.Get(ctx, "/users").ToJSON(&users)
+users, err := client.Get(ctx, "/users").ToJSON[[]User]()
 ```
 
 `WithTimeout` 是 `http.Client.Timeout`，覆盖整个请求生命周期（连接、重定向、读取 Body）。使用外部 `WithHTTPClient` 时请直接设置其 `Timeout`。
 
+单个请求的超时用 `Timeout`，不需要自己创建 Context：
+
+```go
+user, err := client.Get(ctx, "/slow").Timeout(3 * time.Second).ToJSON[User]()
+```
+
+- 同样覆盖读取 Body 的时间，超时错误满足 `errors.Is(err, context.DeadlineExceeded)`。
+- 与 `WithTimeout`、传入的 Context 同时生效，以最先到期的为准。
+- 在发送时生效（`Do`、`ToJSON`、`ToSSE` 等）；`Build` 返回的请求不带该超时。
+  使用 `Do` 时，关闭响应 Body 会释放计时器。
+
 ## Body 生命周期
 
 - `Do()`：不读取、不关闭响应 Body，调用方必须关闭。
-- `ToJSON` / `ToBytes` / `ToString`：读取完成后自动关闭 Body；非 2xx 也会关闭。
+- `ToJSON` / `ToJSONResponse` / `ToBytes` / `ToString`：读取完成后自动关闭 Body；非 2xx 也会关闭。
+- `ToSSE` / `ToJSONStream`：循环结束（包括 `break`）时自动关闭 Body。
 - `JSON` / `Form`：调用时编码，支持多次 `Build`。
 - `Body(reader)`：不缓冲、不复制、不关闭调用方 Reader，只消费一次。
 - `Build()`：不发送请求。对 `Body(reader)` 连续 Build 两次，第二次从 Reader 当前位置继续读取，通常已经是 EOF。
@@ -737,7 +915,7 @@ if err != nil {
 }
 defer f.Close()
 
-err = client.Post(ctx, "/upload").Body(f).ToJSON(&result)
+result, err := client.Post(ctx, "/upload").Body(f).ToJSON[Result]()
 ```
 
 ## 并发安全
@@ -749,11 +927,10 @@ client := req.New(req.WithBaseURL("https://api.example.com"))
 
 for i := 0; i < 10; i++ {
     go func(i int) {
-        var user User
-        _ = client.Get(context.Background(), "/users").
+        _, _ = client.Get(context.Background(), "/users").
             Query("id", strconv.Itoa(i)).
             Header("X-ID", strconv.Itoa(i)).
-            ToJSON(&user)
+            ToJSON[User]()
     }(i)
 }
 ```
@@ -783,6 +960,11 @@ type Option func(*Client) error
 | `WithProxyFromEnvironment` | 恢复 `http.ProxyFromEnvironment`；这是默认行为 |
 | `WithProxyFunc` | 使用标准库 Proxy 函数；由 Transport 按连接尝试调用 |
 | `WithMaxResponseBytes` | 设置 ToJSON/ToBytes/ToString 的读取上限 |
+| `WithoutRedirect` | 不跟随重定向，直接返回 3xx 响应；不可与 HTTPClient 组合 |
+| `WithCheckRedirect` | 设置 `http.Client.CheckRedirect`；不可与 HTTPClient 组合；与 WithoutRedirect 最后一个生效 |
+| `WithQuery` | 设置默认 Query 参数；URL 中已有同名参数时不添加；同名最后一次生效 |
+| `WithBeforeRequest` | 累积请求钩子，按添加顺序在 Build 时执行；不能为 nil |
+| `WithErrorCheck` | 设置判定 API 错误的 ErrorCheck；不能为 nil；可被 `Request.ErrorCheck` 覆盖 |
 | `WithDebug` | 开启或关闭 Debug；默认关闭 |
 | `WithDebugWriter` | 设置 Debug 输出目标；默认 `os.Stdout` |
 | `WithDebugBody` | 开启或关闭 Body 捕获；Debug 开启时默认开启 |
@@ -914,4 +1096,4 @@ go test -run '^$' -fuzz '^FuzzProxyConfiguration$' -fuzztime 10s
 go test -run '^$' -fuzz '^FuzzDebugRedaction$' -fuzztime 10s
 ```
 
-测试仅使用标准库 `testing` 与 `httptest`，不依赖公网服务。CI 在 Go 1.21 和当前稳定版执行测试、race 检测和 vet，并在稳定版运行短时间 Fuzz。泛型方法测试使用 `//go:build go1.27`，只在 Go 1.27 及以上的工具链执行。Benchmark 对比原生请求构造与 Builder，并测量 JSON 和 Debug 的分配开销；响应 Benchmark 使用本地 RoundTripper，不代表真实网络性能。
+测试仅使用标准库 `testing` 与 `httptest`，不依赖公网服务。CI 在 Go 1.27 和当前稳定版执行测试、race 检测和 vet，并在稳定版运行短时间 Fuzz。Benchmark 对比原生请求构造与 Builder，并测量 JSON 和 Debug 的分配开销；响应 Benchmark 使用本地 RoundTripper，不代表真实网络性能。

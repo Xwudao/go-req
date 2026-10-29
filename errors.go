@@ -20,14 +20,6 @@ var (
 	//
 	// Do and Build are not affected by this limit.
 	ErrResponseTooLarge = errors.New("req: response body exceeds size limit")
-
-	// ErrErrorBodyDecode reports that a non-2xx response body could not be
-	// decoded into the target supplied to Request.ErrorJSON or
-	// StatusError.DecodeJSON.
-	//
-	// The *StatusError and its raw body remain available through errors.As,
-	// so a malformed error payload never hides the HTTP status.
-	ErrErrorBodyDecode = errors.New("req: decode error response JSON")
 )
 
 func configError(format string, args ...any) error {

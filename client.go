@@ -23,7 +23,7 @@ const (
 	// and ToString. It is 64 MiB.
 	DefaultMaxResponseBytes int64 = 64 << 20
 
-	// maxErrorBodyBytes limits the body copied into a StatusError. Error
+	// maxErrorBodyBytes limits the body copied into a ResponseError. Error
 	// responses are never read without a bound. It is 64 KiB.
 	maxErrorBodyBytes int64 = 64 << 10
 )
@@ -41,7 +41,10 @@ type Client struct {
 	httpClient       *http.Client
 	baseURL          *url.URL
 	header           http.Header
+	query            url.Values
+	beforeRequest    []func(*http.Request) error
 	maxResponseBytes int64
+	errorCheck       ErrorCheck
 	err              error
 
 	debug        debugConfig
@@ -60,6 +63,8 @@ type Client struct {
 	proxyFunc      func(*http.Request) (*url.URL, error)
 	proxyOption    string
 	hasProxyConfig bool
+	checkRedirect  func(req *http.Request, via []*http.Request) error
+	redirectOption string
 }
 
 func newClient() *Client {
@@ -139,6 +144,12 @@ func (c *Client) finalize() error {
 			"WithDialContext cannot be combined with WithTransport; configure http.Transport.DialContext directly",
 		))
 	}
+	if c.hasHTTPClient && c.redirectOption != "" {
+		conflicts = append(conflicts, configError(
+			"%s cannot be combined with WithHTTPClient; set http.Client.CheckRedirect instead",
+			c.redirectOption,
+		))
+	}
 	if c.hasHTTPClient && c.hasProxyConfig {
 		conflicts = append(conflicts, configError(
 			"%s cannot be combined with WithHTTPClient; set http.Client.Transport.Proxy instead",
@@ -167,8 +178,9 @@ func (c *Client) finalize() error {
 		return err
 	}
 	c.httpClient = &http.Client{
-		Transport: transport,
-		Timeout:   c.timeout,
+		Transport:     transport,
+		Timeout:       c.timeout,
+		CheckRedirect: c.checkRedirect,
 	}
 	return nil
 }
@@ -323,10 +335,30 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		if enabled {
 			return c.doDebug(req)
 		}
-		return c.httpClient.Do(req)
+		return c.clientFor(req).Do(req)
 	}
 	if c.debug.enabled {
 		return c.doDebug(req)
 	}
-	return c.httpClient.Do(req)
+	return c.clientFor(req).Do(req)
+}
+
+// noRedirectContextKey carries a builder-level NoRedirect through Build and
+// Client.Do.
+type noRedirectContextKey struct{}
+
+// clientFor returns the http.Client used to send req. A request built with
+// NoRedirect uses a shallow copy that stops at the first redirect response,
+// so the shared client, its Transport, and its Jar are left untouched.
+func (c *Client) clientFor(req *http.Request) *http.Client {
+	if noRedirect, _ := req.Context().Value(noRedirectContextKey{}).(bool); !noRedirect {
+		return c.httpClient
+	}
+	hc := *c.httpClient
+	hc.CheckRedirect = stopRedirect
+	return &hc
+}
+
+func stopRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }

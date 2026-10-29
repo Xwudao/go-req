@@ -54,8 +54,7 @@ func BenchmarkResponse(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				var v struct{ Name string }
-				if err := c.Get(context.Background(), "https://example.test").ToJSON(&v); err != nil {
+				if _, err := c.Get(context.Background(), "https://example.test").ToJSON[struct{ Name string }](); err != nil {
 					b.Fatal(err)
 				}
 			}

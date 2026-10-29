@@ -30,8 +30,8 @@ func TestResponseOptions(t *testing.T) {
 	ctx := context.Background()
 	s := bodyServer(t, 200, `{"n":9007199254740993,"extra":true}`)
 	c := New(WithMaxResponseBytes(1))
-	var result map[string]any
-	if err := c.Get(ctx, s.URL).MaxResponseBytes(100).UseNumber(true).ToJSON(&result); err != nil {
+	result, err := c.Get(ctx, s.URL).MaxResponseBytes(100).UseNumber(true).ToJSON[map[string]any]()
+	if err != nil {
 		t.Fatal(err)
 	}
 	if result["n"] != json.Number("9007199254740993") {
@@ -40,10 +40,10 @@ func TestResponseOptions(t *testing.T) {
 	if _, err := c.Get(ctx, s.URL).ToBytes(); !errors.Is(err, ErrResponseTooLarge) {
 		t.Fatal(err)
 	}
-	var target struct {
+	type target struct {
 		N json.Number `json:"n"`
 	}
-	if err := c.Get(ctx, s.URL).MaxResponseBytes(100).DisallowUnknownFields(true).ToJSON(&target); err == nil {
+	if _, err := c.Get(ctx, s.URL).MaxResponseBytes(100).DisallowUnknownFields(true).ToJSON[target](); err == nil {
 		t.Fatal("expected unknown field error")
 	}
 	for _, n := range []int64{0, -1, math.MaxInt64} {
@@ -53,7 +53,7 @@ func TestResponseOptions(t *testing.T) {
 	}
 	for _, body := range []string{`{} {}`, `{} trailing`, ` `} {
 		srv := bodyServer(t, 200, body)
-		if err := New().Get(ctx, srv.URL).ToJSON(&result); err == nil {
+		if _, err := New().Get(ctx, srv.URL).ToJSON[map[string]any](); err == nil {
 			t.Fatalf("accepted %q", body)
 		}
 	}
@@ -82,7 +82,7 @@ func TestToWriter(t *testing.T) {
 	s = bodyServer(t, 500, strings.Repeat("x", int(maxErrorBodyBytes)+1))
 	dst.Reset()
 	_, err = c.Get(ctx, s.URL).ToWriter(&dst)
-	var se *StatusError
+	var se *ResponseError
 	if !errors.As(err, &se) || !se.BodyTruncated || len(se.Body) != int(maxErrorBodyBytes) || dst.Len() != 0 {
 		t.Fatalf("bad status error: %v", err)
 	}

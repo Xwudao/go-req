@@ -54,13 +54,13 @@ func TestDebugRequestAndResponse(t *testing.T) {
 		req.WithHeader("X-Client", "yes"),
 	)
 	ctx := context.Background()
-	var out struct {
-		ID int `json:"id"`
-	}
-	if err := client.Post(ctx, "/users?page=1").
+	out, err := client.Post(ctx, "/users?page=1").
 		Header("X-Request", "yes").
 		JSON(map[string]string{"name": "Alice"}).
-		ToJSON(&out); err != nil {
+		ToJSON[struct {
+		ID int `json:"id"`
+	}]()
+	if err != nil {
 		t.Fatalf("ToJSON: %v", err)
 	}
 	if out.ID != 7 {
@@ -610,10 +610,10 @@ func TestDebugWriterErrorDoesNotAffectRequest(t *testing.T) {
 		req.WithDebugWriter(failingDebugWriter{}),
 		req.WithBaseURL(srv.URL),
 	)
-	var out struct {
+	out, err := client.Get(context.Background(), "/").ToJSON[struct {
 		OK bool `json:"ok"`
-	}
-	if err := client.Get(context.Background(), "/").ToJSON(&out); err != nil {
+	}]()
+	if err != nil {
 		t.Fatalf("ToJSON: %v", err)
 	}
 	if !out.OK {
